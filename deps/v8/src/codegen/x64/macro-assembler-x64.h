@@ -152,8 +152,12 @@ class V8_EXPORT_PRIVATE TurboAssembler
   void Cvtqui2sd(XMMRegister dst, Operand src);
   void Cvttsd2uiq(Register dst, Operand src, Label* fail = nullptr);
   void Cvttsd2uiq(Register dst, XMMRegister src, Label* fail = nullptr);
+  void Cvttsd2ui(Register dst, Operand src, Label* fail = nullptr);
+  void Cvttsd2ui(Register dst, XMMRegister src, Label* fail = nullptr);
   void Cvttss2uiq(Register dst, Operand src, Label* fail = nullptr);
   void Cvttss2uiq(Register dst, XMMRegister src, Label* fail = nullptr);
+  void Cvttss2ui(Register dst, Operand src, Label* fail = nullptr);
+  void Cvttss2ui(Register dst, XMMRegister src, Label* fail = nullptr);
 
   // cvtsi2sd and cvtsi2ss instructions only write to the low 64/32-bit of dst
   // register, which hinders register renaming and makes dependence chains
@@ -314,8 +318,12 @@ class V8_EXPORT_PRIVATE TurboAssembler
 
   void Move(XMMRegister dst, uint32_t src);
   void Move(XMMRegister dst, uint64_t src);
-  void Move(XMMRegister dst, float src) { Move(dst, bit_cast<uint32_t>(src)); }
-  void Move(XMMRegister dst, double src) { Move(dst, bit_cast<uint64_t>(src)); }
+  void Move(XMMRegister dst, float src) {
+    Move(dst, base::bit_cast<uint32_t>(src));
+  }
+  void Move(XMMRegister dst, double src) {
+    Move(dst, base::bit_cast<uint64_t>(src));
+  }
   void Move(XMMRegister dst, uint64_t high, uint64_t low);
 
   // Move if the registers are not identical.
@@ -412,8 +420,8 @@ class V8_EXPORT_PRIVATE TurboAssembler
   void Jump(Address destination, RelocInfo::Mode rmode);
   void Jump(const ExternalReference& reference);
   void Jump(Operand op);
-  void Jump(Handle<CodeT> code_object, RelocInfo::Mode rmode,
-            Condition cc = always);
+  void Jump(Handle<CodeT> code_object, RelocInfo::Mode rmode);
+  void Jump(Handle<CodeT> code_object, RelocInfo::Mode rmode, Condition cc);
 
   void BailoutIfDeoptimized(Register scratch);
   void CallForDeoptimization(Builtin target, int deopt_id, Label* exit,
@@ -499,19 +507,14 @@ class V8_EXPORT_PRIVATE TurboAssembler
 #endif
   }
 
-  void MaybeSaveRegisters(RegList registers);
-  void MaybeRestoreRegisters(RegList registers);
-
   void CallEphemeronKeyBarrier(Register object, Register slot_address,
                                SaveFPRegsMode fp_mode);
 
   void CallRecordWriteStubSaveRegisters(
-      Register object, Register slot_address,
-      RememberedSetAction remembered_set_action, SaveFPRegsMode fp_mode,
+      Register object, Register slot_address, SaveFPRegsMode fp_mode,
       StubCallMode mode = StubCallMode::kCallBuiltinPointer);
   void CallRecordWriteStub(
-      Register object, Register slot_address,
-      RememberedSetAction remembered_set_action, SaveFPRegsMode fp_mode,
+      Register object, Register slot_address, SaveFPRegsMode fp_mode,
       StubCallMode mode = StubCallMode::kCallBuiltinPointer);
 
 #ifdef V8_IS_TSAN
@@ -528,25 +531,27 @@ class V8_EXPORT_PRIVATE TurboAssembler
   // Calculate how much stack space (in bytes) are required to store caller
   // registers excluding those specified in the arguments.
   int RequiredStackSizeForCallerSaved(SaveFPRegsMode fp_mode,
-                                      Register exclusion1 = no_reg,
-                                      Register exclusion2 = no_reg,
-                                      Register exclusion3 = no_reg) const;
+                                      Register exclusion = no_reg) const;
 
   // PushCallerSaved and PopCallerSaved do not arrange the registers in any
   // particular order so they are not useful for calls that can cause a GC.
-  // The caller can exclude up to 3 registers that do not need to be saved and
+  // The caller can exclude a register that does not need to be saved and
   // restored.
 
   // Push caller saved registers on the stack, and return the number of bytes
   // stack pointer is adjusted.
-  int PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1 = no_reg,
-                      Register exclusion2 = no_reg,
-                      Register exclusion3 = no_reg);
+  int PushCallerSaved(SaveFPRegsMode fp_mode, Register exclusion = no_reg);
   // Restore caller saved registers from the stack, and return the number of
   // bytes stack pointer is adjusted.
-  int PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion1 = no_reg,
-                     Register exclusion2 = no_reg,
-                     Register exclusion3 = no_reg);
+  int PopCallerSaved(SaveFPRegsMode fp_mode, Register exclusion = no_reg);
+
+  int PushAll(RegList registers);
+  int PopAll(RegList registers);
+
+  int PushAll(DoubleRegList registers,
+              int stack_slot_size = kStackSavedSavedFPSize);
+  int PopAll(DoubleRegList registers,
+             int stack_slot_size = kStackSavedSavedFPSize);
 
   // Compute the start of the generated instruction stream from the current PC.
   // This is an alternative to embedding the {CodeObject} handle as a reference.
@@ -569,12 +574,21 @@ class V8_EXPORT_PRIVATE TurboAssembler
   // compression is enabled.
   void LoadTaggedPointerField(Register destination, Operand field_operand);
 
+  // Loads a field containing a HeapObject but does not decompress it when
+  // pointer compression is enabled.
+  void LoadTaggedPointerField(TaggedRegister destination,
+                              Operand field_operand);
+
   // Loads a field containing a Smi and decompresses it if pointer compression
   // is enabled.
   void LoadTaggedSignedField(Register destination, Operand field_operand);
 
   // Loads a field containing any tagged value and decompresses it if necessary.
   void LoadAnyTaggedField(Register destination, Operand field_operand);
+
+  // Loads a field containing any tagged value but does not decompress it when
+  // pointer compression is enabled.
+  void LoadAnyTaggedField(TaggedRegister destination, Operand field_operand);
 
   // Loads a field containing a HeapObject, decompresses it if necessary and
   // pushes full pointer to the stack. When pointer compression is enabled,
@@ -691,22 +705,18 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
   // stored.  value and scratch registers are clobbered by the operation.
   // The offset is the offset from the start of the object, not the offset from
   // the tagged HeapObject pointer.  For use with FieldOperand(reg, off).
-  void RecordWriteField(
-      Register object, int offset, Register value, Register slot_address,
-      SaveFPRegsMode save_fp,
-      RememberedSetAction remembered_set_action = RememberedSetAction::kEmit,
-      SmiCheck smi_check = SmiCheck::kInline);
+  void RecordWriteField(Register object, int offset, Register value,
+                        Register slot_address, SaveFPRegsMode save_fp,
+                        SmiCheck smi_check = SmiCheck::kInline);
 
   // For page containing |object| mark region covering |address|
   // dirty. |object| is the object being stored into, |value| is the
   // object being stored. The address and value registers are clobbered by the
   // operation.  RecordWrite filters out smis so it does not update
   // the write barrier if the value is a smi.
-  void RecordWrite(
-      Register object, Register slot_address, Register value,
-      SaveFPRegsMode save_fp,
-      RememberedSetAction remembered_set_action = RememberedSetAction::kEmit,
-      SmiCheck smi_check = SmiCheck::kInline);
+  void RecordWrite(Register object, Register slot_address, Register value,
+                   SaveFPRegsMode save_fp,
+                   SmiCheck smi_check = SmiCheck::kInline);
 
   // Enter specific kind of exit frame; either in normal or
   // debug mode. Expects the number of arguments in register rax and
@@ -811,6 +821,9 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
     }
     andq(reg, Immediate(mask));
   }
+
+  void TestCodeTIsMarkedForDeoptimization(Register codet, Register scratch);
+  Immediate ClearedValue() const;
 
   // Abort execution if argument is not a CodeT, enabled via --debug-code.
   void AssertCodeT(Register object);
@@ -934,6 +947,17 @@ inline Operand FieldOperand(Register object, int offset) {
   return Operand(object, offset - kHeapObjectTag);
 }
 
+// Generate an Operand for loading a field from an object. Object pointer is a
+// compressed pointer when pointer compression is enabled.
+inline Operand FieldOperand(TaggedRegister object, int offset) {
+  if (COMPRESS_POINTERS_BOOL) {
+    return Operand(kPtrComprCageBaseRegister, object.reg(),
+                   ScaleFactor::times_1, offset - kHeapObjectTag);
+  } else {
+    return Operand(object.reg(), offset - kHeapObjectTag);
+  }
+}
+
 // Generate an Operand for loading an indexed field from an object.
 inline Operand FieldOperand(Register object, Register index, ScaleFactor scale,
                             int offset) {
@@ -953,6 +977,12 @@ inline Operand StackSpaceOperand(int index) {
 inline Operand StackOperandForReturnAddress(int32_t disp) {
   return Operand(rsp, disp);
 }
+
+struct MoveCycleState {
+  // Whether a move in the cycle needs the scratch or double scratch register.
+  bool pending_scratch_register_use = false;
+  bool pending_double_scratch_register_use = false;
+};
 
 #define ACCESS_MASM(masm) masm->
 

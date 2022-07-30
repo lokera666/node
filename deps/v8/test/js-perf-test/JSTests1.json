@@ -160,6 +160,19 @@
           ]
         },
         {
+          "name": "Multiply",
+          "main": "run.js",
+          "flags": ["--allow-natives-syntax"],
+          "resources": ["multiply.js", "bigint-util.js"],
+          "test_flags": ["multiply"],
+          "results_regexp": "^BigInt\\-%s\\(Score\\): (.+)$",
+          "tests": [
+            { "name": "Multiply-Zero" },
+            { "name": "Multiply-Small"},
+            { "name": "Multiply-Random" }
+          ]
+        },
+        {
           "name": "AsUintN",
           "main": "run.js",
           "flags": ["--allow-natives-syntax"],

@@ -10,7 +10,6 @@
 #include "include/v8-cppgc.h"
 #include "include/v8-embedder-heap.h"
 #include "include/v8-traced-handle.h"
-#include "src/common/allow-deprecated.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
 #include "src/flags/flags.h"
@@ -87,8 +86,8 @@ class V8_EXPORT_PRIVATE LocalEmbedderHeapTracer final {
   explicit LocalEmbedderHeapTracer(Isolate* isolate) : isolate_(isolate) {}
 
   ~LocalEmbedderHeapTracer() {
-    if (remote_tracer_) remote_tracer_->isolate_ = nullptr;
-    // CppHeap is not detached from Isolate here. Detaching is done explciitly
+    if (remote_tracer_) remote_tracer_->v8_isolate_ = nullptr;
+    // CppHeap is not detached from Isolate here. Detaching is done explicitly
     // on Isolate/Heap/CppHeap destruction.
   }
 

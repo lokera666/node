@@ -8,6 +8,7 @@
 #include "src/baseline/baseline-assembler.h"
 #include "src/codegen/arm64/macro-assembler-arm64-inl.h"
 #include "src/codegen/interface-descriptors.h"
+#include "src/objects/literal-objects-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -88,12 +89,7 @@ MemOperand BaselineAssembler::FeedbackVectorOperand() {
   return MemOperand(fp, BaselineFrameConstants::kFeedbackVectorFromFp);
 }
 
-void BaselineAssembler::Bind(Label* label) {
-  // All baseline compiler binds on arm64 are assumed to be for jump targets.
-  __ BindJumpTarget(label);
-}
-
-void BaselineAssembler::BindWithoutJumpTarget(Label* label) { __ Bind(label); }
+void BaselineAssembler::Bind(Label* label) { __ Bind(label); }
 
 void BaselineAssembler::JumpTarget() { __ JumpTarget(); }
 
@@ -479,6 +475,34 @@ void BaselineAssembler::StoreTaggedFieldNoWriteBarrier(Register target,
   __ StoreTaggedField(value, FieldMemOperand(target, offset));
 }
 
+void BaselineAssembler::TryLoadOptimizedOsrCode(Register scratch_and_result,
+                                                Register feedback_vector,
+                                                FeedbackSlot slot,
+                                                Label* on_result,
+                                                Label::Distance) {
+  Label fallthrough, clear_slot;
+  LoadTaggedPointerField(scratch_and_result, feedback_vector,
+                         FeedbackVector::OffsetOfElementAt(slot.ToInt()));
+  __ LoadWeakValue(scratch_and_result, scratch_and_result, &fallthrough);
+
+  // Is it marked_for_deoptimization? If yes, clear the slot.
+  {
+    ScratchRegisterScope temps(this);
+    __ JumpIfCodeTIsMarkedForDeoptimization(
+        scratch_and_result, temps.AcquireScratch(), &clear_slot);
+    __ B(on_result);
+  }
+
+  __ bind(&clear_slot);
+  __ Mov(scratch_and_result, __ ClearedValue());
+  StoreTaggedFieldNoWriteBarrier(
+      feedback_vector, FeedbackVector::OffsetOfElementAt(slot.ToInt()),
+      scratch_and_result);
+
+  __ bind(&fallthrough);
+  Move(scratch_and_result, 0);
+}
+
 void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
     int32_t weight, Label* skip_interrupt_label) {
   ASM_CODE_COMMENT(masm_);
@@ -519,6 +543,61 @@ void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
   __ Str(interrupt_budget,
          FieldMemOperand(feedback_cell, FeedbackCell::kInterruptBudgetOffset));
   if (skip_interrupt_label) __ B(ge, skip_interrupt_label);
+}
+
+void BaselineAssembler::LdaContextSlot(Register context, uint32_t index,
+                                       uint32_t depth) {
+  for (; depth > 0; --depth) {
+    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+  }
+  LoadTaggedAnyField(kInterpreterAccumulatorRegister, context,
+                     Context::OffsetOfElementAt(index));
+}
+
+void BaselineAssembler::StaContextSlot(Register context, Register value,
+                                       uint32_t index, uint32_t depth) {
+  for (; depth > 0; --depth) {
+    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+  }
+  StoreTaggedFieldWithWriteBarrier(context, Context::OffsetOfElementAt(index),
+                                   value);
+}
+
+void BaselineAssembler::LdaModuleVariable(Register context, int cell_index,
+                                          uint32_t depth) {
+  for (; depth > 0; --depth) {
+    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+  }
+  LoadTaggedPointerField(context, context, Context::kExtensionOffset);
+  if (cell_index > 0) {
+    LoadTaggedPointerField(context, context,
+                           SourceTextModule::kRegularExportsOffset);
+    // The actual array index is (cell_index - 1).
+    cell_index -= 1;
+  } else {
+    LoadTaggedPointerField(context, context,
+                           SourceTextModule::kRegularImportsOffset);
+    // The actual array index is (-cell_index - 1).
+    cell_index = -cell_index - 1;
+  }
+  LoadFixedArrayElement(context, context, cell_index);
+  LoadTaggedAnyField(kInterpreterAccumulatorRegister, context,
+                     Cell::kValueOffset);
+}
+
+void BaselineAssembler::StaModuleVariable(Register context, Register value,
+                                          int cell_index, uint32_t depth) {
+  for (; depth > 0; --depth) {
+    LoadTaggedPointerField(context, context, Context::kPreviousOffset);
+  }
+  LoadTaggedPointerField(context, context, Context::kExtensionOffset);
+  LoadTaggedPointerField(context, context,
+                         SourceTextModule::kRegularExportsOffset);
+
+  // The actual array index is (cell_index - 1).
+  cell_index -= 1;
+  LoadFixedArrayElement(context, context, cell_index);
+  StoreTaggedFieldWithWriteBarrier(context, Cell::kValueOffset, value);
 }
 
 void BaselineAssembler::AddSmi(Register lhs, Smi rhs) {

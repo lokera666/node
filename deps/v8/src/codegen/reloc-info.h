@@ -5,7 +5,6 @@
 #ifndef V8_CODEGEN_RELOC_INFO_H_
 #define V8_CODEGEN_RELOC_INFO_H_
 
-#include "src/codegen/flush-instruction-cache.h"
 #include "src/common/globals.h"
 #include "src/objects/code.h"
 
@@ -73,7 +72,8 @@ class RelocInfo {
     EXTERNAL_REFERENCE,  // The address of an external C++ function.
     INTERNAL_REFERENCE,  // An address inside the same function.
 
-    // Encoded internal reference, used only on RISCV64, MIPS, MIPS64 and PPC.
+    // Encoded internal reference, used only on RISCV64, RISCV32, MIPS, MIPS64
+    // and PPC.
     INTERNAL_REFERENCE_ENCODED,
 
     // An off-heap instruction stream target. See http://goo.gl/Z2HUiM.
@@ -109,7 +109,7 @@ class RelocInfo {
     FIRST_SHAREABLE_RELOC_MODE = WASM_CALL,
   };
 
-  STATIC_ASSERT(NUMBER_OF_MODES <= kBitsPerInt);
+  static_assert(NUMBER_OF_MODES <= kBitsPerInt);
 
   RelocInfo() = default;
 
@@ -414,7 +414,6 @@ class RelocInfoWriter {
   inline void WriteMode(RelocInfo::Mode rmode);
   inline void WriteModeAndPC(uint32_t pc_delta, RelocInfo::Mode rmode);
   inline void WriteIntData(int data_delta);
-  inline void WriteData(intptr_t data_delta);
 
   byte* pos_;
   byte* last_pc_;

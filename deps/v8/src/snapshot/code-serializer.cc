@@ -9,13 +9,11 @@
 #include "src/base/logging.h"
 #include "src/base/platform/elapsed-timer.h"
 #include "src/base/platform/platform.h"
-#include "src/codegen/macro-assembler.h"
+#include "src/codegen/background-merge-task.h"
 #include "src/common/globals.h"
-#include "src/debug/debug.h"
 #include "src/handles/maybe-handles.h"
 #include "src/handles/persistent-handles.h"
 #include "src/heap/heap-inl.h"
-#include "src/heap/local-factory-inl.h"
 #include "src/heap/parked-scope.h"
 #include "src/logging/counters-scopes.h"
 #include "src/logging/log.h"
@@ -310,10 +308,11 @@ void CreateInterpreterDataForDeserializedCode(Isolate* isolate,
 
     if (!log_code_creation) continue;
     Handle<AbstractCode> abstract_code = Handle<AbstractCode>::cast(code);
+    Script::InitLineEnds(isolate, script);
     int line_num = script->GetLineNumber(info->StartPosition()) + 1;
     int column_num = script->GetColumnNumber(info->StartPosition()) + 1;
     PROFILE(isolate,
-            CodeCreateEvent(CodeEventListener::FUNCTION_TAG, abstract_code,
+            CodeCreateEvent(LogEventListener::CodeTag::kFunction, abstract_code,
                             info, name_handle, line_num, column_num));
   }
 }
@@ -354,9 +353,9 @@ void FinalizeDeserialization(Isolate* isolate,
                              Handle<SharedFunctionInfo> result,
                              const base::ElapsedTimer& timer) {
   const bool log_code_creation =
-      isolate->logger()->is_listening_to_code_events() ||
+      isolate->v8_file_logger()->is_listening_to_code_events() ||
       isolate->is_profiling() ||
-      isolate->code_event_dispatcher()->IsListeningToCodeEvents();
+      isolate->logger()->is_listening_to_code_events();
 
 #ifndef V8_TARGET_ARCH_ARM
   if (V8_UNLIKELY(FLAG_interpreted_frames_native_stack))
@@ -396,13 +395,13 @@ void FinalizeDeserialization(Isolate* isolate,
               script->GetLineNumber(shared_info->StartPosition()) + 1;
           int column_num =
               script->GetColumnNumber(shared_info->StartPosition()) + 1;
-          PROFILE(
-              isolate,
-              CodeCreateEvent(
-                  shared_info->is_toplevel() ? CodeEventListener::SCRIPT_TAG
-                                             : CodeEventListener::FUNCTION_TAG,
-                  handle(shared_info->abstract_code(isolate), isolate),
-                  shared_info, name, line_num, column_num));
+          PROFILE(isolate,
+                  CodeCreateEvent(
+                      shared_info->is_toplevel()
+                          ? LogEventListener::CodeTag::kScript
+                          : LogEventListener::CodeTag::kFunction,
+                      handle(shared_info->abstract_code(isolate), isolate),
+                      shared_info, name, line_num, column_num));
         }
       }
     }
@@ -467,6 +466,25 @@ MaybeHandle<SharedFunctionInfo> CodeSerializer::Deserialize(
   return scope.CloseAndEscape(result);
 }
 
+Handle<Script> CodeSerializer::OffThreadDeserializeData::GetOnlyScript(
+    LocalHeap* heap) {
+  std::unique_ptr<PersistentHandles> previous_persistent_handles =
+      heap->DetachPersistentHandles();
+  heap->AttachPersistentHandles(std::move(persistent_handles));
+
+  DCHECK_EQ(scripts.size(), 1);
+  // Make a non-persistent handle to return.
+  Handle<Script> script = handle(*scripts[0], heap);
+  DCHECK_EQ(*script, maybe_result.ToHandleChecked()->script());
+
+  persistent_handles = heap->DetachPersistentHandles();
+  if (previous_persistent_handles) {
+    heap->AttachPersistentHandles(std::move(previous_persistent_handles));
+  }
+
+  return script;
+}
+
 CodeSerializer::OffThreadDeserializeData
 CodeSerializer::StartDeserializeOffThread(LocalIsolate* local_isolate,
                                           AlignedCachedData* cached_data) {
@@ -498,7 +516,8 @@ CodeSerializer::StartDeserializeOffThread(LocalIsolate* local_isolate,
 MaybeHandle<SharedFunctionInfo> CodeSerializer::FinishOffThreadDeserialize(
     Isolate* isolate, OffThreadDeserializeData&& data,
     AlignedCachedData* cached_data, Handle<String> source,
-    ScriptOriginOptions origin_options) {
+    ScriptOriginOptions origin_options,
+    BackgroundMergeTask* background_merge_task) {
   base::ElapsedTimer timer;
   if (FLAG_profile_deserialization || FLAG_log_function_events) timer.Start();
 
@@ -545,23 +564,32 @@ MaybeHandle<SharedFunctionInfo> CodeSerializer::FinishOffThreadDeserialize(
   DCHECK(data.persistent_handles->Contains(result.location()));
   result = handle(*result, isolate);
 
-  // Fix up the source on the script. This should be the only deserialized
-  // script, and the off-thread deserializer should have set its source to
-  // the empty string.
-  DCHECK_EQ(data.scripts.size(), 1);
-  DCHECK_EQ(result->script(), *data.scripts[0]);
-  DCHECK_EQ(Script::cast(result->script()).source(),
-            ReadOnlyRoots(isolate).empty_string());
-  Script::cast(result->script()).set_source(*source);
+  if (background_merge_task &&
+      background_merge_task->HasPendingForegroundWork()) {
+    Handle<Script> script = handle(Script::cast(result->script()), isolate);
+    result = background_merge_task->CompleteMergeInForeground(isolate, script);
+    DCHECK(Script::cast(result->script()).source().StrictEquals(*source));
+    DCHECK(isolate->factory()->script_list()->Contains(
+        MaybeObject::MakeWeak(MaybeObject::FromObject(result->script()))));
+  } else {
+    // Fix up the source on the script. This should be the only deserialized
+    // script, and the off-thread deserializer should have set its source to
+    // the empty string.
+    DCHECK_EQ(data.scripts.size(), 1);
+    DCHECK_EQ(result->script(), *data.scripts[0]);
+    DCHECK_EQ(Script::cast(result->script()).source(),
+              ReadOnlyRoots(isolate).empty_string());
+    Script::cast(result->script()).set_source(*source);
 
-  // Fix up the script list to include the newly deserialized script.
-  Handle<WeakArrayList> list = isolate->factory()->script_list();
-  for (Handle<Script> script : data.scripts) {
-    DCHECK(data.persistent_handles->Contains(script.location()));
-    list =
-        WeakArrayList::AddToEnd(isolate, list, MaybeObjectHandle::Weak(script));
+    // Fix up the script list to include the newly deserialized script.
+    Handle<WeakArrayList> list = isolate->factory()->script_list();
+    for (Handle<Script> script : data.scripts) {
+      DCHECK(data.persistent_handles->Contains(script.location()));
+      list = WeakArrayList::AddToEnd(isolate, list,
+                                     MaybeObjectHandle::Weak(script));
+    }
+    isolate->heap()->SetRootScriptList(*list);
   }
-  isolate->heap()->SetRootScriptList(*list);
 
   if (FLAG_profile_deserialization) {
     double ms = timer.Elapsed().InMillisecondsF();

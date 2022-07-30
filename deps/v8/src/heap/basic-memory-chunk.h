@@ -179,9 +179,9 @@ class BasicMemoryChunk {
   void ClearFlag(Flag flag) {
     main_thread_flags_ = main_thread_flags_.without(flag);
   }
-  void ClearFlags(MainThreadFlags flags) { main_thread_flags_ &= ~flags; }
   // Set or clear multiple flags at a time. `mask` indicates which flags are
   // should be replaced with new `flags`.
+  void ClearFlags(MainThreadFlags flags) { main_thread_flags_ &= ~flags; }
   void SetFlags(MainThreadFlags flags, MainThreadFlags mask = kAllFlagsMask) {
     main_thread_flags_ = (main_thread_flags_ & ~mask) | (flags & mask);
   }
@@ -367,18 +367,16 @@ class BasicMemoryChunk {
 
   friend class BasicMemoryChunkValidator;
   friend class ConcurrentMarkingState;
-  friend class MajorMarkingState;
-  friend class MajorAtomicMarkingState;
-  friend class MajorNonAtomicMarkingState;
+  friend class MarkingState;
+  friend class AtomicMarkingState;
+  friend class NonAtomicMarkingState;
   friend class MemoryAllocator;
-  friend class MinorMarkingState;
-  friend class MinorNonAtomicMarkingState;
   friend class PagedSpace;
 };
 
 DEFINE_OPERATORS_FOR_FLAGS(BasicMemoryChunk::MainThreadFlags)
 
-STATIC_ASSERT(std::is_standard_layout<BasicMemoryChunk>::value);
+static_assert(std::is_standard_layout<BasicMemoryChunk>::value);
 
 }  // namespace internal
 }  // namespace v8

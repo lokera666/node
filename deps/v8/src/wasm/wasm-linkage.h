@@ -12,7 +12,6 @@
 #include "src/codegen/aligned-slot-allocator.h"
 #include "src/codegen/assembler-arch.h"
 #include "src/codegen/machine-type.h"
-#include "src/codegen/signature.h"
 #include "src/wasm/value-type.h"
 
 namespace v8 {
@@ -116,7 +115,7 @@ constexpr Register kGpReturnRegisters[] = {r2, r3};
 constexpr DoubleRegister kFpParamRegisters[] = {d0, d2};
 constexpr DoubleRegister kFpReturnRegisters[] = {d0, d2};
 
-#elif V8_TARGET_ARCH_RISCV64
+#elif V8_TARGET_ARCH_RISCV32 || V8_TARGET_ARCH_RISCV64
 // ===========================================================================
 // == riscv64 =================================================================
 // ===========================================================================

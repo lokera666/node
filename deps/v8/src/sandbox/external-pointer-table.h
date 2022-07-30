@@ -11,7 +11,7 @@
 #include "src/base/platform/mutex.h"
 #include "src/common/globals.h"
 
-#ifdef V8_SANDBOX_IS_AVAILABLE
+#ifdef V8_COMPRESS_POINTERS
 
 namespace v8 {
 namespace internal {
@@ -19,7 +19,10 @@ namespace internal {
 class Isolate;
 
 /**
- * A table storing pointers to objects outside the sandbox.
+ * A table storing pointers to objects outside the V8 heap.
+ *
+ * When V8_ENABLE_SANDBOX, its primary use is for pointing to objects outside
+ * the sandbox, as described below.
  *
  * An external pointer table provides the basic mechanisms to ensure
  * memory-safe access to objects located outside the sandbox, but referenced
@@ -57,6 +60,9 @@ class Isolate;
  * to store the index of the next free entry. When the freelist is empty and a
  * new entry is allocated, the table grows in place and the freelist is
  * re-populated from the newly added entries.
+ *
+ * When V8_COMPRESS_POINTERS, external pointer tables are also used to ease
+ * alignment requirements in heap object fields via indirection.
  */
 class V8_EXPORT_PRIVATE ExternalPointerTable {
  public:
@@ -73,15 +79,25 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
   // Resets this external pointer table and deletes all associated memory.
   inline void TearDown();
 
-  // Retrieves the entry at the given index.
+  // Retrieves the entry referenced by the given handle.
   //
   // This method is atomic and can be called from background threads.
-  inline Address Get(uint32_t index, ExternalPointerTag tag) const;
+  inline Address Get(ExternalPointerHandle handle,
+                     ExternalPointerTag tag) const;
 
-  // Sets the entry at the given index to the given value.
+  // Sets the entry referenced by the given handle.
   //
   // This method is atomic and can be called from background threads.
-  inline void Set(uint32_t index, Address value, ExternalPointerTag tag);
+  inline void Set(ExternalPointerHandle handle, Address value,
+                  ExternalPointerTag tag);
+
+  // Exchanges the entry referenced by the given handle with the given value,
+  // returning the previous value. The same tag is applied both to decode the
+  // previous value and encode the given value.
+  //
+  // This method is atomic and can call be called from background threads.
+  inline Address Exchange(ExternalPointerHandle handle, Address value,
+                          ExternalPointerTag tag);
 
   // Allocates a new entry in the external pointer table. The caller must
   // initialize the entry afterwards through set(). In particular, the caller is
@@ -89,20 +105,17 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
   // TODO(saelo) this can fail, in which case we should probably do GC + retry.
   //
   // This method is atomic and can be called from background threads.
-  inline uint32_t Allocate();
-
-  // Runtime function called from CSA. Internally just calls Allocate().
-  static uint32_t AllocateEntry(ExternalPointerTable* table);
+  inline ExternalPointerHandle Allocate();
 
   // Marks the specified entry as alive.
   //
   // This method is atomic and can be called from background threads.
-  inline void Mark(uint32_t index);
+  inline void Mark(ExternalPointerHandle index);
 
   // Frees unmarked entries.
   //
-  // This method must be called on the mutator thread or while that thread is
-  // stopped.
+  // This method must only be called while mutator threads are stopped as it is
+  // not safe to allocate table entries while the table is being swept.
   //
   // Returns the number of live entries after sweeping.
   uint32_t Sweep(Isolate* isolate);
@@ -113,10 +126,20 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
 
   // An external pointer table grows in blocks of this size. This is also the
   // initial size of the table.
-  static const size_t kBlockSize = 64 * KB;
+  //
+  // The external pointer table is used both for sandboxing external pointers
+  // and for easing alignment requirements when compressing pointers. When just
+  // doing the latter, expect less usage.
+  static const size_t kBlockSize =
+      SandboxedExternalPointersAreEnabled() ? 64 * KB : 16 * KB;
   static const size_t kEntriesPerBlock = kBlockSize / kSystemPointerSize;
 
-  static const Address kExternalPointerMarkBit = 1ULL << 63;
+  // When the table is swept, it first sets the freelist head to this special
+  // value to better catch any violation of the "don't-alloc-while-sweeping"
+  // requirement (see Sweep()). This value is chosen so it points to the last
+  // entry in the table, which should usually be inaccessible (PROT_NONE).
+  static const uint32_t kTableIsCurrentlySweepingMarker =
+      (kExternalPointerTableReservationSize / kSystemPointerSize) - 1;
 
   // Returns true if this external pointer table has been initialized.
   bool is_initialized() { return buffer_ != kNullAddress; }
@@ -132,6 +155,19 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
     return buffer_ + index * sizeof(Address);
   }
 
+  // When LeakSanitizer is enabled, this method will write the untagged (raw)
+  // pointer into the shadow table (located after the real table) at the given
+  // index. This is necessary because LSan is unable to scan the pointers in
+  // the main table due to the pointer tagging scheme (the values don't "look
+  // like" pointers). So instead it can scan the pointers in the shadow table.
+  inline void lsan_record_ptr(uint32_t index, Address value) {
+#if defined(LEAK_SANITIZER)
+    base::Memory<Address>(entry_address(index) +
+                          kExternalPointerTableReservationSize) =
+        value & ~kExternalPointerTagMask;
+#endif  // LEAK_SANITIZER
+  }
+
   // Loads the value at the given index. This method is non-atomic, only use it
   // when no other threads can currently access the table.
   inline Address load(uint32_t index) const {
@@ -141,6 +177,7 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
   // Stores the provided value at the given index. This method is non-atomic,
   // only use it when no other threads can currently access the table.
   inline void store(uint32_t index, Address value) {
+    lsan_record_ptr(index, value);
     base::Memory<Address>(entry_address(index)) = value;
   }
 
@@ -152,8 +189,16 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
 
   // Atomically stores the provided value at the given index.
   inline void store_atomic(uint32_t index, Address value) {
+    lsan_record_ptr(index, value);
     auto addr = reinterpret_cast<base::Atomic64*>(entry_address(index));
     base::Relaxed_Store(addr, value);
+  }
+
+  // Atomically exchanges the value at the given index with the provided value.
+  inline Address exchange_atomic(uint32_t index, Address value) {
+    lsan_record_ptr(index, value);
+    auto addr = reinterpret_cast<base::Atomic64*>(entry_address(index));
+    return static_cast<Address>(base::Relaxed_AtomicExchange(addr, value));
   }
 
   static bool is_marked(Address entry) {
@@ -188,7 +233,7 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
   uint32_t capacity_ = 0;
 
   // The index of the first entry on the freelist or zero if the list is empty.
-  uint32_t freelist_head_ = 0;
+  base::Atomic32 freelist_head_ = 0;
 
   // Lock protecting the slow path for entry allocation, in particular Grow().
   // As the size of this structure must be predictable (it's part of
@@ -200,6 +245,6 @@ class V8_EXPORT_PRIVATE ExternalPointerTable {
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_SANDBOX_IS_AVAILABLE
+#endif  // V8_COMPRESS_POINTERS
 
 #endif  // V8_SANDBOX_EXTERNAL_POINTER_TABLE_H_

@@ -55,7 +55,7 @@ TQ_OBJECT_CONSTRUCTORS_IMPL(WasmStruct)
 TQ_OBJECT_CONSTRUCTORS_IMPL(WasmArray)
 TQ_OBJECT_CONSTRUCTORS_IMPL(WasmContinuationObject)
 TQ_OBJECT_CONSTRUCTORS_IMPL(WasmSuspenderObject)
-TQ_OBJECT_CONSTRUCTORS_IMPL(WasmOnFulfilledData)
+TQ_OBJECT_CONSTRUCTORS_IMPL(WasmResumeData)
 
 CAST_ACCESSOR(WasmInstanceObject)
 
@@ -145,7 +145,7 @@ double WasmGlobalObject::GetF64() {
 }
 
 Handle<Object> WasmGlobalObject::GetRef() {
-  // We use this getter for externref and funcref.
+  // We use this getter for externref, funcref, and stringref.
   DCHECK(type().is_reference());
   return handle(tagged_buffer().get(offset()), GetIsolate());
 }
@@ -167,7 +167,7 @@ void WasmGlobalObject::SetF64(double value) {
 }
 
 void WasmGlobalObject::SetExternRef(Handle<Object> value) {
-  DCHECK(type().is_reference_to(wasm::HeapType::kAny));
+  DCHECK(type().is_reference_to(wasm::HeapType::kExtern));
   tagged_buffer().set(offset(), *value);
 }
 
@@ -179,6 +179,12 @@ bool WasmGlobalObject::SetFuncRef(Isolate* isolate, Handle<Object> value) {
     return true;
   }
   return false;
+}
+
+void WasmGlobalObject::SetStringRef(Handle<Object> value) {
+  DCHECK_EQ(type(), wasm::kWasmStringRef);
+  DCHECK(value->IsNull() || value->IsString());
+  tagged_buffer().set(offset(), *value);
 }
 
 // WasmInstanceObject
@@ -199,10 +205,12 @@ PRIMITIVE_ACCESSORS(WasmInstanceObject, old_allocation_limit_address, Address*,
                     kOldAllocationLimitAddressOffset)
 PRIMITIVE_ACCESSORS(WasmInstanceObject, old_allocation_top_address, Address*,
                     kOldAllocationTopAddressOffset)
+PRIMITIVE_ACCESSORS(WasmInstanceObject, isorecursive_canonical_types,
+                    const uint32_t*, kIsorecursiveCanonicalTypesOffset)
 PRIMITIVE_ACCESSORS(WasmInstanceObject, imported_function_targets, Address*,
                     kImportedFunctionTargetsOffset)
-PRIMITIVE_ACCESSORS(WasmInstanceObject, globals_start, byte*,
-                    kGlobalsStartOffset)
+SANDBOXED_POINTER_ACCESSORS(WasmInstanceObject, globals_start, byte*,
+                            kGlobalsStartOffset)
 PRIMITIVE_ACCESSORS(WasmInstanceObject, imported_mutable_globals, Address*,
                     kImportedMutableGlobalsOffset)
 PRIMITIVE_ACCESSORS(WasmInstanceObject, indirect_function_table_size, uint32_t,
@@ -279,6 +287,16 @@ WasmExportedFunction::WasmExportedFunction(Address ptr) : JSFunction(ptr) {
   SLOW_DCHECK(IsWasmExportedFunction(*this));
 }
 CAST_ACCESSOR(WasmExportedFunction)
+
+// WasmInternalFunction
+EXTERNAL_POINTER_ACCESSORS(WasmInternalFunction, call_target, Address,
+                           kCallTargetOffset,
+                           kWasmInternalFunctionCallTargetTag)
+
+void WasmInternalFunction::AllocateExternalPointerEntries(Isolate* isolate) {
+  InitExternalPointerField<kWasmInternalFunctionCallTargetTag>(
+      kCallTargetOffset, isolate);
+}
 
 // WasmFunctionData
 ACCESSORS(WasmFunctionData, internal, WasmInternalFunction, kInternalOffset)
@@ -362,7 +380,7 @@ Handle<Object> WasmObject::ReadValueAt(Isolate* isolate, Handle<HeapObject> obj,
       UNREACHABLE();
 
     case wasm::kRef:
-    case wasm::kOptRef: {
+    case wasm::kRefNull: {
       ObjectSlot slot(field_address);
       return handle(slot.load(isolate), isolate);
     }
@@ -393,7 +411,7 @@ MaybeHandle<Object> WasmObject::ToWasmValue(Isolate* isolate,
       return BigInt::FromObject(isolate, value);
 
     case wasm::kRef:
-    case wasm::kOptRef: {
+    case wasm::kRefNull: {
       // TODO(v8:11804): implement ref type check
       UNREACHABLE();
     }
@@ -471,7 +489,7 @@ void WasmObject::WriteValueAt(Isolate* isolate, Handle<HeapObject> obj,
       break;
     }
     case wasm::kRef:
-    case wasm::kOptRef:
+    case wasm::kRefNull:
       // TODO(v8:11804): implement
       UNREACHABLE();
 
@@ -507,7 +525,7 @@ wasm::StructType* WasmStruct::GcSafeType(Map map) {
 int WasmStruct::Size(const wasm::StructType* type) {
   // Object size must fit into a Smi (because of filler objects), and its
   // computation must not overflow.
-  STATIC_ASSERT(Smi::kMaxValue <= kMaxInt);
+  static_assert(Smi::kMaxValue <= kMaxInt);
   DCHECK_LE(type->total_fields_size(), Smi::kMaxValue - kHeaderSize);
   return std::max(kHeaderSize + static_cast<int>(type->total_fields_size()),
                   Heap::kMinObjectSizeInTaggedWords * kTaggedSize);
@@ -520,7 +538,7 @@ void WasmStruct::EncodeInstanceSizeInMap(int instance_size, Map map) {
   // map so that the GC can read it without relying on any other objects
   // still being around. To solve this problem, we store the instance size
   // in two other fields that are otherwise unused for WasmStructs.
-  STATIC_ASSERT(0xFFFF - kHeaderSize >
+  static_assert(0xFFFF - kHeaderSize >
                 wasm::kMaxValueTypeSize * wasm::kV8MaxWasmStructFields);
   map.SetWasmByte1(instance_size & 0xFF);
   map.SetWasmByte2(instance_size >> 8);
@@ -621,15 +639,6 @@ void WasmArray::EncodeElementSizeInMap(int element_size, Map map) {
 
 // static
 int WasmArray::DecodeElementSizeFromMap(Map map) { return map.WasmByte1(); }
-
-void WasmTypeInfo::clear_foreign_address(Isolate* isolate) {
-#ifdef V8_SANDBOXED_EXTERNAL_POINTERS
-  // Due to the type-specific pointer tags for external pointers, we need to
-  // allocate an entry in the table here even though it will just store nullptr.
-  AllocateExternalPointerEntries(isolate);
-#endif
-  set_foreign_address(isolate, 0);
-}
 
 #include "src/objects/object-macros-undef.h"
 

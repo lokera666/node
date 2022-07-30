@@ -14,7 +14,7 @@
 #include "src/execution/isolate.h"
 #include "src/interpreter/bytecodes.h"
 #include "src/logging/code-events.h"  // For CodeCreateEvent.
-#include "src/logging/log.h"          // For Logger.
+#include "src/logging/log.h"          // For V8FileLogger.
 #include "src/objects/fixed-array.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/visitors.h"
@@ -42,9 +42,9 @@ struct BuiltinMetadata {
     interpreter::OperandScale scale : 8;
   };
 
-  STATIC_ASSERT(sizeof(interpreter::Bytecode) == 1);
-  STATIC_ASSERT(sizeof(interpreter::OperandScale) == 1);
-  STATIC_ASSERT(sizeof(BytecodeAndScale) <= sizeof(Address));
+  static_assert(sizeof(interpreter::Bytecode) == 1);
+  static_assert(sizeof(interpreter::OperandScale) == 1);
+  static_assert(sizeof(BytecodeAndScale) <= sizeof(Address));
 
   // The `data` field has kind-specific contents.
   union KindSpecificData {
@@ -114,7 +114,7 @@ const char* Builtins::Lookup(Address pc) {
   if (!initialized_) return nullptr;
   for (Builtin builtin_ix = Builtins::kFirst; builtin_ix <= Builtins::kLast;
        ++builtin_ix) {
-    if (FromCodeT(code(builtin_ix)).contains(isolate_, pc)) {
+    if (code(builtin_ix).contains(isolate_, pc)) {
       return name(builtin_ix);
     }
   }
@@ -332,7 +332,7 @@ void Builtins::InitializeIsolateDataTables(Isolate* isolate) {
 
 // static
 void Builtins::EmitCodeCreateEvents(Isolate* isolate) {
-  if (!isolate->logger()->is_listening_to_code_events() &&
+  if (!isolate->v8_file_logger()->is_listening_to_code_events() &&
       !isolate->is_profiling()) {
     return;  // No need to iterate the entire table in this case.
   }
@@ -341,23 +341,23 @@ void Builtins::EmitCodeCreateEvents(Isolate* isolate) {
   int i = 0;
   HandleScope scope(isolate);
   for (; i < ToInt(Builtin::kFirstBytecodeHandler); i++) {
-    Code builtin_code = FromCodeT(CodeT::cast(Object(builtins[i])));
-    Handle<AbstractCode> code(AbstractCode::cast(builtin_code), isolate);
-    PROFILE(isolate, CodeCreateEvent(CodeEventListener::BUILTIN_TAG, code,
+    Handle<CodeT> builtin_code(&builtins[i]);
+    Handle<AbstractCode> code = ToAbstractCode(builtin_code, isolate);
+    PROFILE(isolate, CodeCreateEvent(LogEventListener::CodeTag::kBuiltin, code,
                                      Builtins::name(FromInt(i))));
   }
 
-  STATIC_ASSERT(kLastBytecodeHandlerPlusOne == kBuiltinCount);
+  static_assert(kLastBytecodeHandlerPlusOne == kBuiltinCount);
   for (; i < kBuiltinCount; i++) {
-    Code builtin_code = FromCodeT(CodeT::cast(Object(builtins[i])));
-    Handle<AbstractCode> code(AbstractCode::cast(builtin_code), isolate);
+    Handle<CodeT> builtin_code(&builtins[i]);
+    Handle<AbstractCode> code = ToAbstractCode(builtin_code, isolate);
     interpreter::Bytecode bytecode =
         builtin_metadata[i].data.bytecode_and_scale.bytecode;
     interpreter::OperandScale scale =
         builtin_metadata[i].data.bytecode_and_scale.scale;
     PROFILE(isolate,
             CodeCreateEvent(
-                CodeEventListener::BYTECODE_HANDLER_TAG, code,
+                LogEventListener::CodeTag::kBytecodeHandler, code,
                 interpreter::Bytecodes::ToString(bytecode, scale).c_str()));
   }
 }
@@ -523,6 +523,7 @@ bool Builtins::CodeObjectIsExecutable(Builtin builtin) {
     case Builtin::kInstantiateAsmJs:
 #if V8_ENABLE_WEBASSEMBLY
     case Builtin::kGenericJSToWasmWrapper:
+    case Builtin::kWasmReturnPromiseOnSuspend:
 #endif  // V8_ENABLE_WEBASSEMBLY
 
     // TODO(delphick): Remove this when calls to it have the trampoline inlined

@@ -211,6 +211,8 @@ class V8_EXPORT Isolate {
     CreateParams();
     ~CreateParams();
 
+    ALLOW_COPY_AND_MOVE_WITH_DEPRECATED_FIELDS(CreateParams)
+
     /**
      * Allows the host application to provide the address of a function that is
      * notified each time code is added, moved or removed.
@@ -301,16 +303,18 @@ class V8_EXPORT Isolate {
    */
   class V8_EXPORT V8_NODISCARD Scope {
    public:
-    explicit Scope(Isolate* isolate) : isolate_(isolate) { isolate->Enter(); }
+    explicit Scope(Isolate* isolate) : v8_isolate_(isolate) {
+      v8_isolate_->Enter();
+    }
 
-    ~Scope() { isolate_->Exit(); }
+    ~Scope() { v8_isolate_->Exit(); }
 
     // Prevent copying of Scope objects.
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 
    private:
-    Isolate* const isolate_;
+    Isolate* const v8_isolate_;
   };
 
   /**
@@ -331,7 +335,7 @@ class V8_EXPORT Isolate {
 
    private:
     OnFailure on_failure_;
-    Isolate* isolate_;
+    v8::Isolate* v8_isolate_;
 
     bool was_execution_allowed_assert_;
     bool was_execution_allowed_throws_;
@@ -353,7 +357,7 @@ class V8_EXPORT Isolate {
         const AllowJavascriptExecutionScope&) = delete;
 
    private:
-    Isolate* isolate_;
+    Isolate* v8_isolate_;
     bool was_execution_allowed_assert_;
     bool was_execution_allowed_throws_;
     bool was_execution_allowed_dump_;
@@ -376,7 +380,7 @@ class V8_EXPORT Isolate {
         const SuppressMicrotaskExecutionScope&) = delete;
 
    private:
-    internal::Isolate* const isolate_;
+    internal::Isolate* const i_isolate_;
     internal::MicrotaskQueue* const microtask_queue_;
     internal::Address previous_stack_height_;
 
@@ -389,7 +393,7 @@ class V8_EXPORT Isolate {
    */
   class V8_EXPORT V8_NODISCARD SafeForTerminationScope {
    public:
-    explicit SafeForTerminationScope(v8::Isolate* isolate);
+    explicit SafeForTerminationScope(v8::Isolate* v8_isolate);
     ~SafeForTerminationScope();
 
     // Prevent copying of Scope objects.
@@ -397,7 +401,7 @@ class V8_EXPORT Isolate {
     SafeForTerminationScope& operator=(const SafeForTerminationScope&) = delete;
 
    private:
-    internal::Isolate* isolate_;
+    internal::Isolate* i_isolate_;
     bool prev_value_;
   };
 
@@ -636,9 +640,6 @@ class V8_EXPORT Isolate {
    * This specifies the callback called by the upcoming dynamic
    * import() language feature to load modules.
    */
-  V8_DEPRECATED("Use HostImportModuleDynamicallyCallback")
-  void SetHostImportModuleDynamicallyCallback(
-      HostImportModuleDynamicallyWithImportAssertionsCallback callback);
   void SetHostImportModuleDynamicallyCallback(
       HostImportModuleDynamicallyCallback callback);
 
@@ -838,12 +839,6 @@ class V8_EXPORT Isolate {
    * \returns the adjusted value.
    */
   int64_t AdjustAmountOfExternalAllocatedMemory(int64_t change_in_bytes);
-
-  /**
-   * Returns the number of phantom handles without callbacks that were reset
-   * by the garbage collector since the last call to this function.
-   */
-  size_t NumberOfPhantomHandleResetsSinceLastCall();
 
   /**
    * Returns heap profiler for this isolate. Will return NULL until the isolate
@@ -1523,14 +1518,18 @@ class V8_EXPORT Isolate {
 
   void SetWasmStreamingCallback(WasmStreamingCallback callback);
 
+  void SetWasmAsyncResolvePromiseCallback(
+      WasmAsyncResolvePromiseCallback callback);
+
   void SetWasmLoadSourceMapCallback(WasmLoadSourceMapCallback callback);
 
   void SetWasmSimdEnabledCallback(WasmSimdEnabledCallback callback);
 
   void SetWasmExceptionsEnabledCallback(WasmExceptionsEnabledCallback callback);
 
-  void SetWasmDynamicTieringEnabledCallback(
-      WasmDynamicTieringEnabledCallback callback);
+  V8_DEPRECATED("Dynamic tiering is now enabled by default")
+  void SetWasmDynamicTieringEnabledCallback(WasmDynamicTieringEnabledCallback) {
+  }
 
   void SetSharedArrayBufferConstructorEnabledCallback(
       SharedArrayBufferConstructorEnabledCallback callback);
@@ -1597,19 +1596,6 @@ class V8_EXPORT Isolate {
    * guarantee that visited objects are still alive.
    */
   void VisitExternalResources(ExternalResourceVisitor* visitor);
-
-  /**
-   * Iterates through all the persistent handles in the current isolate's heap
-   * that have class_ids.
-   */
-  void VisitHandlesWithClassIds(PersistentHandleVisitor* visitor);
-
-  /**
-   * Iterates through all the persistent handles in the current isolate's heap
-   * that have class_ids and are weak to be marked as inactive if there is no
-   * pending activity for the handle.
-   */
-  void VisitWeakHandles(PersistentHandleVisitor* visitor);
 
   /**
    * Check if this isolate is in use.

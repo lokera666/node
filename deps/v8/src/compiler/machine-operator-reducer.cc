@@ -12,7 +12,6 @@
 #include "src/base/ieee754.h"
 #include "src/base/logging.h"
 #include "src/base/overflowing-math.h"
-#include "src/codegen/tnode.h"
 #include "src/compiler/diamond.h"
 #include "src/compiler/graph.h"
 #include "src/compiler/js-operator.h"
@@ -172,11 +171,11 @@ MachineOperatorReducer::MachineOperatorReducer(Editor* editor,
 MachineOperatorReducer::~MachineOperatorReducer() = default;
 
 
-Node* MachineOperatorReducer::Float32Constant(volatile float value) {
+Node* MachineOperatorReducer::Float32Constant(float value) {
   return graph()->NewNode(common()->Float32Constant(value));
 }
 
-Node* MachineOperatorReducer::Float64Constant(volatile double value) {
+Node* MachineOperatorReducer::Float64Constant(double value) {
   return mcgraph()->Float64Constant(value);
 }
 
@@ -249,12 +248,12 @@ Node* MachineOperatorReducer::Int32Div(Node* dividend, int32_t divisor) {
   DCHECK_NE(0, divisor);
   DCHECK_NE(std::numeric_limits<int32_t>::min(), divisor);
   base::MagicNumbersForDivision<uint32_t> const mag =
-      base::SignedDivisionByConstant(bit_cast<uint32_t>(divisor));
+      base::SignedDivisionByConstant(base::bit_cast<uint32_t>(divisor));
   Node* quotient = graph()->NewNode(machine()->Int32MulHigh(), dividend,
                                     Uint32Constant(mag.multiplier));
-  if (divisor > 0 && bit_cast<int32_t>(mag.multiplier) < 0) {
+  if (divisor > 0 && base::bit_cast<int32_t>(mag.multiplier) < 0) {
     quotient = Int32Add(quotient, dividend);
-  } else if (divisor < 0 && bit_cast<int32_t>(mag.multiplier) > 0) {
+  } else if (divisor < 0 && base::bit_cast<int32_t>(mag.multiplier) > 0) {
     quotient = Int32Sub(quotient, dividend);
   }
   return Int32Add(Word32Sar(quotient, mag.shift), Word32Shr(dividend, 31));
@@ -288,22 +287,6 @@ Node* MachineOperatorReducer::TruncateInt64ToInt32(Node* value) {
   Reduction const reduction = ReduceTruncateInt64ToInt32(node);
   return reduction.Changed() ? reduction.replacement() : node;
 }
-
-namespace {
-bool ObjectsMayAlias(Node* a, Node* b) {
-  if (a != b) {
-    if (NodeProperties::IsFreshObject(b)) std::swap(a, b);
-    if (NodeProperties::IsFreshObject(a) &&
-        (NodeProperties::IsFreshObject(b) ||
-         b->opcode() == IrOpcode::kParameter ||
-         b->opcode() == IrOpcode::kLoadImmutable ||
-         IrOpcode::IsConstantOpcode(b->opcode()))) {
-      return false;
-    }
-  }
-  return true;
-}
-}  // namespace
 
 // Perform constant folding and strength reduction on machine operators.
 Reduction MachineOperatorReducer::Reduce(Node* node) {
@@ -360,11 +343,6 @@ Reduction MachineOperatorReducer::Reduce(Node* node) {
       }
       // TODO(turbofan): fold HeapConstant, ExternalReference, pointer compares
       if (m.LeftEqualsRight()) return ReplaceBool(true);  // x == x => true
-      // This is a workaround for not having escape analysis for wasm
-      // (machine-level) turbofan graphs.
-      if (!ObjectsMayAlias(m.left().node(), m.right().node())) {
-        return ReplaceBool(false);
-      }
       break;
     }
     case IrOpcode::kInt32Add:
@@ -1686,6 +1664,20 @@ Reduction MachineOperatorReducer::ReduceWordNAnd(Node* node) {
   typename A::IntNBinopMatcher m(node);
   if (m.right().Is(0)) return Replace(m.right().node());  // x & 0  => 0
   if (m.right().Is(-1)) return Replace(m.left().node());  // x & -1 => x
+  if (m.right().Is(1)) {
+    // (x + x) & 1 => 0
+    Node* left = m.left().node();
+    while (left->opcode() == IrOpcode::kTruncateInt64ToInt32 ||
+           left->opcode() == IrOpcode::kChangeInt32ToInt64 ||
+           left->opcode() == IrOpcode::kChangeUint32ToUint64) {
+      left = left->InputAt(0);
+    }
+    if ((left->opcode() == IrOpcode::kInt32Add ||
+         left->opcode() == IrOpcode::kInt64Add) &&
+        left->InputAt(0) == left->InputAt(1)) {
+      return a.ReplaceIntN(0);
+    }
+  }
   if (m.left().IsComparison() && m.right().Is(1)) {       // CMP & 1 => CMP
     return Replace(m.left().node());
   }
@@ -2080,11 +2072,6 @@ Reduction MachineOperatorReducer::ReduceWord32Equal(Node* node) {
       return Changed(node);
     }
   }
-  // This is a workaround for not having escape analysis for wasm
-  // (machine-level) turbofan graphs.
-  if (!ObjectsMayAlias(m.left().node(), m.right().node())) {
-    return ReplaceBool(false);
-  }
 
   return NoChange();
 }
@@ -2095,9 +2082,9 @@ Reduction MachineOperatorReducer::ReduceFloat64InsertLowWord32(Node* node) {
   Uint32Matcher mrhs(node->InputAt(1));
   if (mlhs.HasResolvedValue() && mrhs.HasResolvedValue()) {
     return ReplaceFloat64(
-        bit_cast<double>((bit_cast<uint64_t>(mlhs.ResolvedValue()) &
-                          uint64_t{0xFFFFFFFF00000000}) |
-                         mrhs.ResolvedValue()));
+        base::bit_cast<double>((base::bit_cast<uint64_t>(mlhs.ResolvedValue()) &
+                                uint64_t{0xFFFFFFFF00000000}) |
+                               mrhs.ResolvedValue()));
   }
   return NoChange();
 }
@@ -2107,8 +2094,9 @@ Reduction MachineOperatorReducer::ReduceFloat64InsertHighWord32(Node* node) {
   Float64Matcher mlhs(node->InputAt(0));
   Uint32Matcher mrhs(node->InputAt(1));
   if (mlhs.HasResolvedValue() && mrhs.HasResolvedValue()) {
-    return ReplaceFloat64(bit_cast<double>(
-        (bit_cast<uint64_t>(mlhs.ResolvedValue()) & uint64_t{0xFFFFFFFF}) |
+    return ReplaceFloat64(base::bit_cast<double>(
+        (base::bit_cast<uint64_t>(mlhs.ResolvedValue()) &
+         uint64_t{0xFFFFFFFF}) |
         (static_cast<uint64_t>(mrhs.ResolvedValue()) << 32)));
   }
   return NoChange();

@@ -7,6 +7,7 @@
 #include "src/base/functional.h"
 #include "src/base/platform/time.h"
 #include "src/common/globals.h"
+#include "src/debug/debug.h"
 #include "src/diagnostics/code-tracer.h"
 #include "src/diagnostics/compilation-statistics.h"
 #include "src/execution/frames.h"
@@ -15,16 +16,15 @@
 #include "src/logging/counters.h"
 #include "src/logging/metrics.h"
 #include "src/objects/heap-number.h"
-#include "src/objects/js-promise.h"
 #include "src/objects/managed-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/strings/string-hasher-inl.h"
 #include "src/utils/ostreams.h"
 #include "src/wasm/function-compiler.h"
-#include "src/wasm/memory-protection-key.h"
 #include "src/wasm/module-compiler.h"
 #include "src/wasm/module-decoder.h"
 #include "src/wasm/module-instantiate.h"
+#include "src/wasm/stacks.h"
 #include "src/wasm/streaming-decoder.h"
 #include "src/wasm/wasm-debug.h"
 #include "src/wasm/wasm-limits.h"
@@ -183,6 +183,7 @@ class WeakScriptHandle {
 
 std::shared_ptr<NativeModule> NativeModuleCache::MaybeGetNativeModule(
     ModuleOrigin origin, base::Vector<const uint8_t> wire_bytes) {
+  if (!FLAG_wasm_native_module_cache_enabled) return nullptr;
   if (origin != kWasmOrigin) return nullptr;
   base::MutexGuard lock(&mutex_);
   size_t prefix_hash = PrefixHash(wire_bytes);
@@ -241,6 +242,7 @@ void NativeModuleCache::StreamingCompilationFailed(size_t prefix_hash) {
 std::shared_ptr<NativeModule> NativeModuleCache::Update(
     std::shared_ptr<NativeModule> native_module, bool error) {
   DCHECK_NOT_NULL(native_module);
+  if (!FLAG_wasm_native_module_cache_enabled) return native_module;
   if (native_module->module()->origin != kWasmOrigin) return native_module;
   base::Vector<const uint8_t> wire_bytes = native_module->wire_bytes();
   DCHECK(!wire_bytes.empty());
@@ -273,6 +275,7 @@ std::shared_ptr<NativeModule> NativeModuleCache::Update(
 }
 
 void NativeModuleCache::Erase(NativeModule* native_module) {
+  if (!FLAG_wasm_native_module_cache_enabled) return;
   if (native_module->module()->origin != kWasmOrigin) return;
   // Happens in some tests where bytes are set directly.
   if (native_module->wire_bytes().empty()) return;
@@ -301,12 +304,7 @@ size_t NativeModuleCache::PrefixHash(base::Vector<const uint8_t> wire_bytes) {
     section_id = static_cast<SectionCode>(decoder.consume_u8());
     uint32_t section_size = decoder.consume_u32v("section size");
     if (section_id == SectionCode::kCodeSectionCode) {
-      uint32_t num_functions = decoder.consume_u32v("num functions");
-      // If {num_functions} is 0, the streaming decoder skips the section. Do
-      // the same here to ensure hashes are consistent.
-      if (num_functions != 0) {
-        hash = base::hash_combine(hash, section_size);
-      }
+      hash = base::hash_combine(hash, section_size);
       break;
     }
     const uint8_t* payload_start = decoder.pc();
@@ -881,12 +879,13 @@ Handle<WasmModuleObject> WasmEngine::ImportNativeModule(
   return module_object;
 }
 
-CompilationStatistics* WasmEngine::GetOrCreateTurboStatistics() {
+std::shared_ptr<CompilationStatistics>
+WasmEngine::GetOrCreateTurboStatistics() {
   base::MutexGuard guard(&mutex_);
   if (compilation_stats_ == nullptr) {
     compilation_stats_.reset(new CompilationStatistics());
   }
-  return compilation_stats_.get();
+  return compilation_stats_;
 }
 
 void WasmEngine::DumpAndResetTurboStatistics() {
@@ -1021,7 +1020,7 @@ void WasmEngine::AddIsolate(Isolate* isolate) {
   // In that case, the current thread might still have the default permissions
   // for the memory protection key (== no access). Thus initialize the
   // permissions now.
-  GetWasmCodeManager()->InitializeMemoryProtectionKeyPermissionsIfSupported();
+  WasmCodeManager::InitializeMemoryProtectionKeyPermissionsIfSupported();
 
   // Install sampling GC callback.
   // TODO(v8:7424): For now we sample module sizes in a GC callback. This will
@@ -1182,7 +1181,7 @@ std::shared_ptr<NativeModule> WasmEngine::NewNativeModule(
     isolate_info->pku_support_sampled = true;
     auto* histogram =
         isolate->counters()->wasm_memory_protection_keys_support();
-    bool has_mpk = GetWasmCodeManager()->HasMemoryProtectionKeySupport();
+    bool has_mpk = WasmCodeManager::HasMemoryProtectionKeySupport();
     histogram->AddSample(has_mpk ? 1 : 0);
   }
 
@@ -1313,40 +1312,6 @@ void WasmEngine::FreeNativeModule(NativeModule* native_module) {
   }
   native_module_cache_.Erase(native_module);
   native_modules_.erase(module);
-}
-
-namespace {
-class SampleTopTierCodeSizeTask : public CancelableTask {
- public:
-  SampleTopTierCodeSizeTask(Isolate* isolate,
-                            std::weak_ptr<NativeModule> native_module)
-      : CancelableTask(isolate),
-        isolate_(isolate),
-        native_module_(std::move(native_module)) {}
-
-  void RunInternal() override {
-    if (std::shared_ptr<NativeModule> native_module = native_module_.lock()) {
-      native_module->SampleCodeSize(isolate_->counters(),
-                                    NativeModule::kAfterTopTier);
-    }
-  }
-
- private:
-  Isolate* const isolate_;
-  const std::weak_ptr<NativeModule> native_module_;
-};
-}  // namespace
-
-void WasmEngine::SampleTopTierCodeSizeInAllIsolates(
-    const std::shared_ptr<NativeModule>& native_module) {
-  base::MutexGuard lock(&mutex_);
-  DCHECK_EQ(1, native_modules_.count(native_module.get()));
-  for (Isolate* isolate : native_modules_[native_module.get()]->isolates) {
-    DCHECK_EQ(1, isolates_.count(isolate));
-    IsolateInfo* info = isolates_[isolate].get();
-    info->foreground_task_runner->PostTask(
-        std::make_unique<SampleTopTierCodeSizeTask>(isolate, native_module));
-  }
 }
 
 void WasmEngine::ReportLiveCodeForGC(Isolate* isolate,
@@ -1654,7 +1619,6 @@ GlobalWasmState* global_wasm_state = nullptr;
 
 // static
 void WasmEngine::InitializeOncePerProcess() {
-  InitializeMemoryProtectionKeySupport();
   DCHECK_NULL(global_wasm_state);
   global_wasm_state = new GlobalWasmState();
 }
@@ -1679,25 +1643,37 @@ WasmCodeManager* GetWasmCodeManager() {
 }
 
 // {max_mem_pages} is declared in wasm-limits.h.
-uint32_t max_mem_pages() {
+uint32_t max_mem32_pages() {
   static_assert(
-      kV8MaxWasmMemoryPages * kWasmPageSize <= JSArrayBuffer::kMaxByteLength,
+      kV8MaxWasmMemory32Pages * kWasmPageSize <= JSArrayBuffer::kMaxByteLength,
       "Wasm memories must not be bigger than JSArrayBuffers");
-  STATIC_ASSERT(kV8MaxWasmMemoryPages <= kMaxUInt32);
-  return std::min(uint32_t{kV8MaxWasmMemoryPages}, FLAG_wasm_max_mem_pages);
+  static_assert(kV8MaxWasmMemory32Pages <= kMaxUInt32);
+  return std::min(uint32_t{kV8MaxWasmMemory32Pages},
+                  FLAG_wasm_max_mem_pages.value());
+}
+
+uint32_t max_mem64_pages() {
+  static_assert(
+      kV8MaxWasmMemory64Pages * kWasmPageSize <= JSArrayBuffer::kMaxByteLength,
+      "Wasm memories must not be bigger than JSArrayBuffers");
+  static_assert(kV8MaxWasmMemory64Pages <= kMaxUInt32);
+  return std::min(uint32_t{kV8MaxWasmMemory64Pages},
+                  FLAG_wasm_max_mem_pages.value());
 }
 
 // {max_table_init_entries} is declared in wasm-limits.h.
 uint32_t max_table_init_entries() {
   return std::min(uint32_t{kV8MaxWasmTableInitEntries},
-                  FLAG_wasm_max_table_size);
+                  FLAG_wasm_max_table_size.value());
 }
 
 // {max_module_size} is declared in wasm-limits.h.
 size_t max_module_size() {
-  return FLAG_experimental_wasm_allow_huge_modules
-             ? RoundDown<kSystemPointerSize>(size_t{kMaxInt})
-             : kV8MaxWasmModuleSize;
+  // Clamp the value of --wasm-max-module-size between 16 and just below 2GB.
+  constexpr size_t kMin = 16;
+  constexpr size_t kMax = RoundDown<kSystemPointerSize>(size_t{kMaxInt});
+  static_assert(kMin <= kV8MaxWasmModuleSize && kV8MaxWasmModuleSize <= kMax);
+  return std::clamp(FLAG_wasm_max_module_size.value(), kMin, kMax);
 }
 
 #undef TRACE_CODE_GC

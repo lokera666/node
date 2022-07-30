@@ -168,7 +168,7 @@ TEST(Unwind_BuiltinPCInMiddle_Success_CodePagesAPI) {
   register_state.fp = stack;
 
   // Put the current PC inside of a valid builtin.
-  Code builtin = FromCodeT(i_isolate->builtins()->code(Builtin::kStringEqual));
+  CodeT builtin = *BUILTIN_CODE(i_isolate, StringEqual);
   const uintptr_t offset = 40;
   CHECK_LT(offset, builtin.InstructionSize());
   register_state.pc =
@@ -225,7 +225,7 @@ TEST(Unwind_BuiltinPCAtStart_Success_CodePagesAPI) {
 
   // Put the current PC at the start of a valid builtin, so that we are setting
   // up the frame.
-  Code builtin = FromCodeT(i_isolate->builtins()->code(Builtin::kStringEqual));
+  CodeT builtin = *BUILTIN_CODE(i_isolate, StringEqual);
   register_state.pc = reinterpret_cast<void*>(builtin.InstructionStart());
 
   bool unwound = v8::Unwinder::TryUnwindV8Frames(
@@ -297,9 +297,10 @@ TEST(Unwind_CodeObjectPCInMiddle_Success_CodePagesAPI) {
 
   // Put the current PC inside of the created code object.
   AbstractCode abstract_code = foo->abstract_code(i_isolate);
-  // We don't produce optimized code when run with --no-opt.
-  if (!abstract_code.IsCode() && FLAG_opt == false) return;
-  CHECK(abstract_code.IsCode());
+  PtrComprCageBase cage_base(i_isolate);
+  // We don't produce optimized code when run with --no-turbofan.
+  if (!abstract_code.IsCode(cage_base) && !FLAG_turbofan) return;
+  CHECK(abstract_code.IsCode(cage_base));
 
   Code code = abstract_code.GetCode();
   // We don't want the offset too early or it could be the `push rbp`
@@ -456,7 +457,7 @@ TEST(Unwind_JSEntry_Fail_CodePagesAPI) {
   CHECK_LE(pages_length, arraysize(code_pages));
   RegisterState register_state;
 
-  Code js_entry = FromCodeT(i_isolate->builtins()->code(Builtin::kJSEntry));
+  CodeT js_entry = *BUILTIN_CODE(i_isolate, JSEntry);
   byte* start = reinterpret_cast<byte*>(js_entry.InstructionStart());
   register_state.pc = start + 10;
 
@@ -638,7 +639,7 @@ TEST(PCIsInV8_InJSEntryRange_CodePagesAPI) {
       isolate->CopyCodePages(arraysize(code_pages), code_pages);
   CHECK_LE(pages_length, arraysize(code_pages));
 
-  Code js_entry = FromCodeT(i_isolate->builtins()->code(Builtin::kJSEntry));
+  CodeT js_entry = *BUILTIN_CODE(i_isolate, JSEntry);
   byte* start = reinterpret_cast<byte*>(js_entry.InstructionStart());
   size_t length = js_entry.InstructionSize();
 

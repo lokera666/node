@@ -24,6 +24,11 @@ class VisitorFactory {
 // use its internals.
 class VisitorBase : public cppgc::Visitor {
  public:
+  template <typename T>
+  static void TraceRawForTesting(cppgc::Visitor* visitor, const T* t) {
+    visitor->TraceImpl(t);
+  }
+
   VisitorBase() : cppgc::Visitor(VisitorFactory::CreateKey()) {}
   ~VisitorBase() override = default;
 
@@ -56,6 +61,8 @@ class ConservativeTracingVisitor {
   VisitFullyConstructedConservatively(HeapObjectHeader&);
   virtual void VisitInConstructionConservatively(HeapObjectHeader&,
                                                  TraceConservativelyCallback) {}
+
+  void V8_EXPORT_PRIVATE TryTracePointerConservatively(Address address);
 
   HeapBase& heap_;
   PageBackend& page_backend_;
