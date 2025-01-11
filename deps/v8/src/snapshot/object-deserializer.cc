@@ -4,14 +4,11 @@
 
 #include "src/snapshot/object-deserializer.h"
 
-#include "src/codegen/assembler-inl.h"
 #include "src/execution/isolate.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/local-factory-inl.h"
 #include "src/objects/allocation-site-inl.h"
-#include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/objects.h"
-#include "src/objects/slots.h"
 #include "src/snapshot/code-serializer.h"
 
 namespace v8 {
@@ -30,9 +27,8 @@ ObjectDeserializer::DeserializeSharedFunctionInfo(
   d.AddAttachedObject(source);
 
   Handle<HeapObject> result;
-  return d.Deserialize().ToHandle(&result)
-             ? Handle<SharedFunctionInfo>::cast(result)
-             : MaybeHandle<SharedFunctionInfo>();
+  return d.Deserialize().ToHandle(&result) ? Cast<SharedFunctionInfo>(result)
+                                           : MaybeHandle<SharedFunctionInfo>();
 }
 
 MaybeHandle<HeapObject> ObjectDeserializer::Deserialize() {
@@ -54,16 +50,6 @@ MaybeHandle<HeapObject> ObjectDeserializer::Deserialize() {
 }
 
 void ObjectDeserializer::CommitPostProcessedObjects() {
-  for (Handle<JSArrayBuffer> buffer : new_off_heap_array_buffers()) {
-    uint32_t store_index = buffer->GetBackingStoreRefForDeserialization();
-    auto bs = backing_store(store_index);
-    SharedFlag shared =
-        bs && bs->is_shared() ? SharedFlag::kShared : SharedFlag::kNotShared;
-    // TODO(v8:11111): Support RAB / GSAB.
-    CHECK(!bs || !bs->is_resizable());
-    buffer->Setup(shared, ResizableFlag::kNotResizable, bs);
-  }
-
   for (Handle<Script> script : new_scripts()) {
     // Assign a new script id to avoid collision.
     script->set_id(isolate()->GetNextScriptId());
@@ -81,7 +67,7 @@ void ObjectDeserializer::LinkAllocationSites() {
   Heap* heap = isolate()->heap();
   // Allocation sites are present in the snapshot, and must be linked into
   // a list at deserialization time.
-  for (Handle<AllocationSite> site : new_allocation_sites()) {
+  for (DirectHandle<AllocationSite> site : new_allocation_sites()) {
     if (!site->HasWeakNext()) continue;
     // TODO(mvstanton): consider treating the heap()->allocation_sites_list()
     // as a (weak) root. If this root is relocated correctly, this becomes
@@ -113,7 +99,7 @@ OffThreadObjectDeserializer::DeserializeSharedFunctionInfo(
   if (!d.Deserialize(deserialized_scripts).ToHandle(&result)) {
     return MaybeHandle<SharedFunctionInfo>();
   }
-  return Handle<SharedFunctionInfo>::cast(result);
+  return Cast<SharedFunctionInfo>(result);
 }
 
 MaybeHandle<HeapObject> OffThreadObjectDeserializer::Deserialize(
@@ -131,7 +117,6 @@ MaybeHandle<HeapObject> OffThreadObjectDeserializer::Deserialize(
   }
 
   Rehash();
-  CHECK(new_off_heap_array_buffers().empty());
 
   // TODO(leszeks): Figure out a better way of dealing with scripts.
   CHECK_EQ(new_scripts().size(), 1);

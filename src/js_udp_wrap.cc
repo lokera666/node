@@ -17,6 +17,7 @@ using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
 using v8::Int32;
+using v8::Isolate;
 using v8::Local;
 using v8::Object;
 using v8::Value;
@@ -136,12 +137,12 @@ SocketAddress JSUDPWrap::GetSockName() {
 void JSUDPWrap::New(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   CHECK(args.IsConstructCall());
-  new JSUDPWrap(env, args.Holder());
+  new JSUDPWrap(env, args.This());
 }
 
 void JSUDPWrap::EmitReceived(const FunctionCallbackInfo<Value>& args) {
   JSUDPWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
   Environment* env = wrap->env();
 
   ArrayBufferViewContents<char> buffer(args[0]);
@@ -175,7 +176,7 @@ void JSUDPWrap::EmitReceived(const FunctionCallbackInfo<Value>& args) {
 
 void JSUDPWrap::OnSendDone(const FunctionCallbackInfo<Value>& args) {
   JSUDPWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
 
   CHECK(args[0]->IsObject());
   CHECK(args[1]->IsInt32());
@@ -188,7 +189,7 @@ void JSUDPWrap::OnSendDone(const FunctionCallbackInfo<Value>& args) {
 
 void JSUDPWrap::OnAfterBind(const FunctionCallbackInfo<Value>& args) {
   JSUDPWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
 
   wrap->listener()->OnAfterBind();
 }
@@ -198,21 +199,22 @@ void JSUDPWrap::Initialize(Local<Object> target,
                            Local<Context> context,
                            void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
-  Local<FunctionTemplate> t = env->NewFunctionTemplate(New);
+  Local<FunctionTemplate> t = NewFunctionTemplate(isolate, New);
   t->InstanceTemplate()
     ->SetInternalFieldCount(UDPWrapBase::kUDPWrapBaseField + 1);
   t->Inherit(AsyncWrap::GetConstructorTemplate(env));
 
   UDPWrapBase::AddMethods(env, t);
-  env->SetProtoMethod(t, "emitReceived", EmitReceived);
-  env->SetProtoMethod(t, "onSendDone", OnSendDone);
-  env->SetProtoMethod(t, "onAfterBind", OnAfterBind);
+  SetProtoMethod(isolate, t, "emitReceived", EmitReceived);
+  SetProtoMethod(isolate, t, "onSendDone", OnSendDone);
+  SetProtoMethod(isolate, t, "onAfterBind", OnAfterBind);
 
-  env->SetConstructorFunction(target, "JSUDPWrap", t);
+  SetConstructorFunction(context, target, "JSUDPWrap", t);
 }
 
 
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(js_udp_wrap, node::JSUDPWrap::Initialize)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(js_udp_wrap, node::JSUDPWrap::Initialize)

@@ -1,4 +1,4 @@
-import { mustCall, mustNotMutateObjectDeep } from '../common/index.mjs';
+import { mustCall, mustNotMutateObjectDeep, isInsideDirWithUnusualChars } from '../common/index.mjs';
 
 import assert from 'assert';
 import fs from 'fs';
@@ -24,11 +24,19 @@ import tmpdir from '../common/tmpdir.js';
 tmpdir.refresh();
 
 let dirc = 0;
-function nextdir() {
-  return join(tmpdir.path, `copy_${++dirc}`);
+function nextdir(dirname) {
+  return tmpdir.resolve(dirname || `copy_%${++dirc}`);
 }
 
 // Synchronous implementation of copy.
+
+// It copies a nested folder containing UTF characters.
+{
+  const src = './test/fixtures/copy/utf/新建文件夹';
+  const dest = nextdir();
+  cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true }));
+  assertDirEquivalent(src, dest);
+}
 
 // It copies a nested folder structure with files and folders.
 {
@@ -37,6 +45,30 @@ function nextdir() {
   cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true }));
   assertDirEquivalent(src, dest);
 }
+
+// It copies a nested folder structure with mode flags.
+// This test is based on fs.promises.copyFile() with `COPYFILE_FICLONE_FORCE`.
+(() => {
+  const src = './test/fixtures/copy/kitchen-sink';
+  const dest = nextdir();
+  try {
+    cpSync(src, dest, mustNotMutateObjectDeep({
+      recursive: true,
+      mode: fs.constants.COPYFILE_FICLONE_FORCE,
+    }));
+  } catch (err) {
+    // If the platform does not support `COPYFILE_FICLONE_FORCE` operation,
+    // it should enter this path.
+    assert.strictEqual(err.syscall, 'copyfile');
+    assert(err.code === 'ENOTSUP' || err.code === 'ENOTTY' ||
+      err.code === 'ENOSYS' || err.code === 'EXDEV');
+    return;
+  }
+
+  // If the platform support `COPYFILE_FICLONE_FORCE` operation,
+  // it should reach to here.
+  assertDirEquivalent(src, dest);
+})();
 
 // It does not throw errors when directory is copied over and force is false.
 {
@@ -95,6 +127,23 @@ function nextdir() {
 }
 
 
+// It overrides target directory with what symlink points to, when dereference is true.
+{
+  const src = nextdir();
+  const symlink = nextdir();
+  const dest = nextdir();
+  mkdirSync(src, mustNotMutateObjectDeep({ recursive: true }));
+  writeFileSync(join(src, 'foo.js'), 'foo', 'utf8');
+  symlinkSync(src, symlink);
+
+  mkdirSync(dest, mustNotMutateObjectDeep({ recursive: true }));
+
+  cpSync(symlink, dest, mustNotMutateObjectDeep({ dereference: true, recursive: true }));
+  const destStat = lstatSync(dest);
+  assert(!destStat.isSymbolicLink());
+  assertDirEquivalent(src, dest);
+}
+
 // It throws error when verbatimSymlinks is not a boolean.
 {
   const src = './test/fixtures/copy/kitchen-sink';
@@ -105,6 +154,14 @@ function nextdir() {
         { code: 'ERR_INVALID_ARG_TYPE' }
       );
     });
+}
+
+// It rejects if options.mode is invalid.
+{
+  assert.throws(
+    () => cpSync('a', 'b', { mode: -1 }),
+    { code: 'ERR_OUT_OF_RANGE' }
+  );
 }
 
 
@@ -207,7 +264,7 @@ function nextdir() {
 }
 
 // It throws error if parent directory of symlink in dest points to src.
-{
+if (!isInsideDirWithUnusualChars) {
   const src = nextdir();
   mkdirSync(join(src, 'a'), mustNotMutateObjectDeep({ recursive: true }));
   const dest = nextdir();
@@ -222,7 +279,7 @@ function nextdir() {
 }
 
 // It throws error if attempt is made to copy directory to file.
-{
+if (!isInsideDirWithUnusualChars) {
   const src = nextdir();
   mkdirSync(src, mustNotMutateObjectDeep({ recursive: true }));
   const dest = './test/fixtures/copy/kitchen-sink/README.md';
@@ -253,13 +310,52 @@ function nextdir() {
 
 
 // It throws error if attempt is made to copy file to directory.
-{
+if (!isInsideDirWithUnusualChars) {
   const src = './test/fixtures/copy/kitchen-sink/README.md';
   const dest = nextdir();
   mkdirSync(dest, mustNotMutateObjectDeep({ recursive: true }));
   assert.throws(
     () => cpSync(src, dest),
     { code: 'ERR_FS_CP_NON_DIR_TO_DIR' }
+  );
+}
+
+// It must not throw error if attempt is made to copy to dest
+// directory with same prefix as src directory
+// regression test for https://github.com/nodejs/node/issues/54285
+{
+  const src = nextdir('prefix');
+  const dest = nextdir('prefix-a');
+  mkdirSync(src);
+  mkdirSync(dest);
+  cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true }));
+}
+
+// It must not throw error if attempt is made to copy to dest
+// directory if the parent of dest has same prefix as src directory
+// regression test for https://github.com/nodejs/node/issues/54285
+{
+  const src = nextdir('aa');
+  const destParent = nextdir('aaa');
+  const dest = nextdir('aaa/aabb');
+  mkdirSync(src);
+  mkdirSync(destParent);
+  mkdirSync(dest);
+  cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true }));
+}
+
+// It throws error if attempt is made to copy src to dest
+// when src is parent directory of the parent of dest
+if (!isInsideDirWithUnusualChars) {
+  const src = nextdir('a');
+  const destParent = nextdir('a/b');
+  const dest = nextdir('a/b/c');
+  mkdirSync(src);
+  mkdirSync(destParent);
+  mkdirSync(dest);
+  assert.throws(
+    () => cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true })),
+    { code: 'ERR_FS_CP_EINVAL' },
   );
 }
 
@@ -274,9 +370,11 @@ function nextdir() {
 }
 
 // It throws an error if attempt is made to copy socket.
-if (!isWindows) {
+if (!isWindows && !isInsideDirWithUnusualChars) {
+  const src = nextdir();
+  mkdirSync(src);
   const dest = nextdir();
-  const sock = `${process.pid}.sock`;
+  const sock = join(src, `${process.pid}.sock`);
   const server = net.createServer();
   server.listen(sock);
   assert.throws(
@@ -368,6 +466,26 @@ if (!isWindows) {
   );
 }
 
+// It throws an error when attempting to copy a file with a name that is too long.
+{
+  const src = 'a'.repeat(5000);
+  const dest = nextdir();
+  assert.throws(
+    () => cpSync(src, dest),
+    { code: isWindows ? 'ENOENT' : 'ENAMETOOLONG' }
+  );
+}
+
+// It throws an error when attempting to copy a dir that does not exist.
+{
+  const src = nextdir();
+  const dest = nextdir();
+  assert.throws(
+    () => cpSync(src, dest, mustNotMutateObjectDeep({ recursive: true })),
+    { code: 'ENOENT' }
+  );
+}
+
 // It makes file writeable when updating timestamp, if not writeable.
 {
   const src = nextdir();
@@ -420,6 +538,31 @@ if (!isWindows) {
   cp(src, dest, mustNotMutateObjectDeep({ recursive: true }), mustCall((err) => {
     assert.strictEqual(err, null);
     assertDirEquivalent(src, dest);
+  }));
+}
+
+// It copies a nested folder structure with mode flags.
+// This test is based on fs.promises.copyFile() with `COPYFILE_FICLONE_FORCE`.
+{
+  const src = './test/fixtures/copy/kitchen-sink';
+  const dest = nextdir();
+  cp(src, dest, mustNotMutateObjectDeep({
+    recursive: true,
+    mode: fs.constants.COPYFILE_FICLONE_FORCE,
+  }), mustCall((err) => {
+    if (!err) {
+      // If the platform support `COPYFILE_FICLONE_FORCE` operation,
+      // it should reach to here.
+      assert.strictEqual(err, null);
+      assertDirEquivalent(src, dest);
+      return;
+    }
+
+    // If the platform does not support `COPYFILE_FICLONE_FORCE` operation,
+    // it should enter this path.
+    assert.strictEqual(err.syscall, 'copyfile');
+    assert(err.code === 'ENOTSUP' || err.code === 'ENOTTY' ||
+      err.code === 'ENOSYS' || err.code === 'EXDEV');
   }));
 }
 
@@ -595,9 +738,11 @@ if (!isWindows) {
 }
 
 // It returns an error if attempt is made to copy socket.
-if (!isWindows) {
+if (!isWindows && !isInsideDirWithUnusualChars) {
+  const src = nextdir();
+  mkdirSync(src);
   const dest = nextdir();
-  const sock = `${process.pid}.sock`;
+  const sock = join(src, `${process.pid}.sock`);
   const server = net.createServer();
   server.listen(sock);
   cp(sock, dest, mustCall((err) => {
@@ -746,11 +891,60 @@ if (!isWindows) {
      }));
 }
 
+// Copy should not throw exception if child folder is filtered out.
+{
+  const src = nextdir();
+  mkdirSync(join(src, 'test-cp'), mustNotMutateObjectDeep({ recursive: true }));
+
+  const dest = nextdir();
+  mkdirSync(dest, mustNotMutateObjectDeep({ recursive: true }));
+  writeFileSync(join(dest, 'test-cp'), 'test-content', mustNotMutateObjectDeep({ mode: 0o444 }));
+
+  const opts = {
+    filter: (path) => !path.includes('test-cp'),
+    recursive: true,
+  };
+  cp(src, dest, opts, mustCall((err) => {
+    assert.strictEqual(err, null);
+  }));
+  cpSync(src, dest, opts);
+}
+
+// Copy should not throw exception if dest is invalid but filtered out.
+{
+  // Create dest as a file.
+  // Expect: cp skips the copy logic entirely and won't throw any exception in path validation process.
+  const src = join(nextdir(), 'bar');
+  mkdirSync(src, mustNotMutateObjectDeep({ recursive: true }));
+
+  const destParent = nextdir();
+  const dest = join(destParent, 'bar');
+  mkdirSync(destParent, mustNotMutateObjectDeep({ recursive: true }));
+  writeFileSync(dest, 'test-content', mustNotMutateObjectDeep({ mode: 0o444 }));
+
+  const opts = {
+    filter: (path) => !path.includes('bar'),
+    recursive: true,
+  };
+  cp(src, dest, opts, mustCall((err) => {
+    assert.strictEqual(err, null);
+  }));
+  cpSync(src, dest, opts);
+}
+
 // It throws if options is not object.
 {
   assert.throws(
     () => cp('a', 'b', 'hello', () => {}),
     { code: 'ERR_INVALID_ARG_TYPE' }
+  );
+}
+
+// It throws if options is not object.
+{
+  assert.throws(
+    () => cp('a', 'b', { mode: -1 }, () => {}),
+    { code: 'ERR_OUT_OF_RANGE' }
   );
 }
 
@@ -763,6 +957,35 @@ if (!isWindows) {
   const p = await fs.promises.cp(src, dest, mustNotMutateObjectDeep({ recursive: true }));
   assert.strictEqual(p, undefined);
   assertDirEquivalent(src, dest);
+}
+
+// It copies a nested folder structure with mode flags.
+// This test is based on fs.promises.copyFile() with `COPYFILE_FICLONE_FORCE`.
+{
+  const src = './test/fixtures/copy/kitchen-sink';
+  const dest = nextdir();
+  let p = null;
+  let successFiClone = false;
+  try {
+    p = await fs.promises.cp(src, dest, mustNotMutateObjectDeep({
+      recursive: true,
+      mode: fs.constants.COPYFILE_FICLONE_FORCE,
+    }));
+    successFiClone = true;
+  } catch (err) {
+    // If the platform does not support `COPYFILE_FICLONE_FORCE` operation,
+    // it should enter this path.
+    assert.strictEqual(err.syscall, 'copyfile');
+    assert(err.code === 'ENOTSUP' || err.code === 'ENOTTY' ||
+      err.code === 'ENOSYS' || err.code === 'EXDEV');
+  }
+
+  if (successFiClone) {
+    // If the platform support `COPYFILE_FICLONE_FORCE` operation,
+    // it should reach to here.
+    assert.strictEqual(p, undefined);
+    assertDirEquivalent(src, dest);
+  }
 }
 
 // It accepts file URL as src and dest.
@@ -799,6 +1022,16 @@ if (!isWindows) {
   await assert.rejects(
     fs.promises.cp('a', 'b', () => {}),
     { code: 'ERR_INVALID_ARG_TYPE' }
+  );
+}
+
+// It rejects if options.mode is invalid.
+{
+  await assert.rejects(
+    fs.promises.cp('a', 'b', {
+      mode: -1,
+    }),
+    { code: 'ERR_OUT_OF_RANGE' }
   );
 }
 

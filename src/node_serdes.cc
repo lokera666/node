@@ -180,13 +180,13 @@ void SerializerContext::New(const FunctionCallbackInfo<Value>& args) {
 
 void SerializerContext::WriteHeader(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
   ctx->serializer_.WriteHeader();
 }
 
 void SerializerContext::WriteValue(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
   Maybe<bool> ret =
       ctx->serializer_.WriteValue(ctx->env()->context(), args[0]);
 
@@ -196,7 +196,7 @@ void SerializerContext::WriteValue(const FunctionCallbackInfo<Value>& args) {
 void SerializerContext::SetTreatArrayBufferViewsAsHostObjects(
     const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   bool value = args[0]->BooleanValue(ctx->env()->isolate());
   ctx->serializer_.SetTreatArrayBufferViewsAsHostObjects(value);
@@ -204,7 +204,7 @@ void SerializerContext::SetTreatArrayBufferViewsAsHostObjects(
 
 void SerializerContext::ReleaseBuffer(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   // Note: Both ValueSerializer and this Buffer::New() variant use malloc()
   // as the underlying allocator.
@@ -221,7 +221,7 @@ void SerializerContext::ReleaseBuffer(const FunctionCallbackInfo<Value>& args) {
 void SerializerContext::TransferArrayBuffer(
     const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<uint32_t> id = args[0]->Uint32Value(ctx->env()->context());
   if (id.IsNothing()) return;
@@ -237,7 +237,7 @@ void SerializerContext::TransferArrayBuffer(
 
 void SerializerContext::WriteUint32(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<uint32_t> value = args[0]->Uint32Value(ctx->env()->context());
   if (value.IsNothing()) return;
@@ -247,7 +247,7 @@ void SerializerContext::WriteUint32(const FunctionCallbackInfo<Value>& args) {
 
 void SerializerContext::WriteUint64(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<uint32_t> arg0 = args[0]->Uint32Value(ctx->env()->context());
   Maybe<uint32_t> arg1 = args[1]->Uint32Value(ctx->env()->context());
@@ -261,7 +261,7 @@ void SerializerContext::WriteUint64(const FunctionCallbackInfo<Value>& args) {
 
 void SerializerContext::WriteDouble(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<double> value = args[0]->NumberValue(ctx->env()->context());
   if (value.IsNothing()) return;
@@ -271,7 +271,7 @@ void SerializerContext::WriteDouble(const FunctionCallbackInfo<Value>& args) {
 
 void SerializerContext::WriteRawBytes(const FunctionCallbackInfo<Value>& args) {
   SerializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   if (!args[0]->IsArrayBufferView()) {
     return node::THROW_ERR_INVALID_ARG_TYPE(
@@ -339,7 +339,7 @@ void DeserializerContext::New(const FunctionCallbackInfo<Value>& args) {
 
 void DeserializerContext::ReadHeader(const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<bool> ret = ctx->deserializer_.ReadHeader(ctx->env()->context());
 
@@ -348,7 +348,7 @@ void DeserializerContext::ReadHeader(const FunctionCallbackInfo<Value>& args) {
 
 void DeserializerContext::ReadValue(const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   MaybeLocal<Value> ret = ctx->deserializer_.ReadValue(ctx->env()->context());
 
@@ -358,7 +358,7 @@ void DeserializerContext::ReadValue(const FunctionCallbackInfo<Value>& args) {
 void DeserializerContext::TransferArrayBuffer(
     const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<uint32_t> id = args[0]->Uint32Value(ctx->env()->context());
   if (id.IsNothing()) return;
@@ -382,14 +382,14 @@ void DeserializerContext::TransferArrayBuffer(
 void DeserializerContext::GetWireFormatVersion(
     const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   args.GetReturnValue().Set(ctx->deserializer_.GetWireFormatVersion());
 }
 
 void DeserializerContext::ReadUint32(const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   uint32_t value;
   bool ok = ctx->deserializer_.ReadUint32(&value);
@@ -399,7 +399,7 @@ void DeserializerContext::ReadUint32(const FunctionCallbackInfo<Value>& args) {
 
 void DeserializerContext::ReadUint64(const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   uint64_t value;
   bool ok = ctx->deserializer_.ReadUint64(&value);
@@ -419,7 +419,7 @@ void DeserializerContext::ReadUint64(const FunctionCallbackInfo<Value>& args) {
 
 void DeserializerContext::ReadDouble(const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   double value;
   bool ok = ctx->deserializer_.ReadDouble(&value);
@@ -430,7 +430,7 @@ void DeserializerContext::ReadDouble(const FunctionCallbackInfo<Value>& args) {
 void DeserializerContext::ReadRawBytes(
     const FunctionCallbackInfo<Value>& args) {
   DeserializerContext* ctx;
-  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&ctx, args.This());
 
   Maybe<int64_t> length_arg = args[0]->IntegerValue(ctx->env()->context());
   if (length_arg.IsNothing()) return;
@@ -455,53 +455,60 @@ void Initialize(Local<Object> target,
                 Local<Context> context,
                 void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
+
   Local<FunctionTemplate> ser =
-      env->NewFunctionTemplate(SerializerContext::New);
+      NewFunctionTemplate(isolate, SerializerContext::New);
 
   ser->InstanceTemplate()->SetInternalFieldCount(
       SerializerContext::kInternalFieldCount);
-  ser->Inherit(BaseObject::GetConstructorTemplate(env));
 
-  env->SetProtoMethod(ser, "writeHeader", SerializerContext::WriteHeader);
-  env->SetProtoMethod(ser, "writeValue", SerializerContext::WriteValue);
-  env->SetProtoMethod(ser, "releaseBuffer", SerializerContext::ReleaseBuffer);
-  env->SetProtoMethod(ser,
-                      "transferArrayBuffer",
-                      SerializerContext::TransferArrayBuffer);
-  env->SetProtoMethod(ser, "writeUint32", SerializerContext::WriteUint32);
-  env->SetProtoMethod(ser, "writeUint64", SerializerContext::WriteUint64);
-  env->SetProtoMethod(ser, "writeDouble", SerializerContext::WriteDouble);
-  env->SetProtoMethod(ser, "writeRawBytes", SerializerContext::WriteRawBytes);
-  env->SetProtoMethod(ser,
-                      "_setTreatArrayBufferViewsAsHostObjects",
-                      SerializerContext::SetTreatArrayBufferViewsAsHostObjects);
+  SetProtoMethod(isolate, ser, "writeHeader", SerializerContext::WriteHeader);
+  SetProtoMethod(isolate, ser, "writeValue", SerializerContext::WriteValue);
+  SetProtoMethod(
+      isolate, ser, "releaseBuffer", SerializerContext::ReleaseBuffer);
+  SetProtoMethod(isolate,
+                 ser,
+                 "transferArrayBuffer",
+                 SerializerContext::TransferArrayBuffer);
+  SetProtoMethod(isolate, ser, "writeUint32", SerializerContext::WriteUint32);
+  SetProtoMethod(isolate, ser, "writeUint64", SerializerContext::WriteUint64);
+  SetProtoMethod(isolate, ser, "writeDouble", SerializerContext::WriteDouble);
+  SetProtoMethod(
+      isolate, ser, "writeRawBytes", SerializerContext::WriteRawBytes);
+  SetProtoMethod(isolate,
+                 ser,
+                 "_setTreatArrayBufferViewsAsHostObjects",
+                 SerializerContext::SetTreatArrayBufferViewsAsHostObjects);
 
   ser->ReadOnlyPrototype();
-  env->SetConstructorFunction(target, "Serializer", ser);
+  SetConstructorFunction(context, target, "Serializer", ser);
 
   Local<FunctionTemplate> des =
-      env->NewFunctionTemplate(DeserializerContext::New);
+      NewFunctionTemplate(isolate, DeserializerContext::New);
 
   des->InstanceTemplate()->SetInternalFieldCount(
       DeserializerContext::kInternalFieldCount);
-  des->Inherit(BaseObject::GetConstructorTemplate(env));
 
-  env->SetProtoMethod(des, "readHeader", DeserializerContext::ReadHeader);
-  env->SetProtoMethod(des, "readValue", DeserializerContext::ReadValue);
-  env->SetProtoMethod(des,
-                      "getWireFormatVersion",
-                      DeserializerContext::GetWireFormatVersion);
-  env->SetProtoMethod(des,
-                      "transferArrayBuffer",
-                      DeserializerContext::TransferArrayBuffer);
-  env->SetProtoMethod(des, "readUint32", DeserializerContext::ReadUint32);
-  env->SetProtoMethod(des, "readUint64", DeserializerContext::ReadUint64);
-  env->SetProtoMethod(des, "readDouble", DeserializerContext::ReadDouble);
-  env->SetProtoMethod(des, "_readRawBytes", DeserializerContext::ReadRawBytes);
+  SetProtoMethod(isolate, des, "readHeader", DeserializerContext::ReadHeader);
+  SetProtoMethod(isolate, des, "readValue", DeserializerContext::ReadValue);
+  SetProtoMethod(isolate,
+                 des,
+                 "getWireFormatVersion",
+                 DeserializerContext::GetWireFormatVersion);
+  SetProtoMethod(isolate,
+                 des,
+                 "transferArrayBuffer",
+                 DeserializerContext::TransferArrayBuffer);
+  SetProtoMethod(isolate, des, "readUint32", DeserializerContext::ReadUint32);
+  SetProtoMethod(isolate, des, "readUint64", DeserializerContext::ReadUint64);
+  SetProtoMethod(isolate, des, "readDouble", DeserializerContext::ReadDouble);
+  SetProtoMethod(
+      isolate, des, "_readRawBytes", DeserializerContext::ReadRawBytes);
 
   des->SetLength(1);
   des->ReadOnlyPrototype();
-  env->SetConstructorFunction(target, "Deserializer", des);
+  SetConstructorFunction(context, target, "Deserializer", des);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -531,5 +538,6 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
 }  // namespace serdes
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(serdes, node::serdes::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(serdes, node::serdes::RegisterExternalReferences)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(serdes, node::serdes::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(serdes,
+                                node::serdes::RegisterExternalReferences)

@@ -275,7 +275,7 @@ testMe.complete('require(\'', common.mustCall(function(error, data) {
   assert.strictEqual(error, null);
   publicModules.forEach((lib) => {
     assert(
-      data[0].includes(lib) && data[0].includes(`node:${lib}`),
+      data[0].includes(lib) && (lib.startsWith('node:') || data[0].includes(`node:${lib}`)),
       `${lib} not found`
     );
   });
@@ -295,7 +295,7 @@ testMe.complete("require\t( 'n", common.mustCall(function(error, data) {
   // require(...) completions include `node:`-prefixed modules:
   let lastIndex = -1;
 
-  publicModules.forEach((lib, index) => {
+  publicModules.filter((lib) => !lib.startsWith('node:')).forEach((lib, index) => {
     lastIndex = data[0].indexOf(`node:${lib}`);
     assert.notStrictEqual(lastIndex, -1);
   });
@@ -405,7 +405,7 @@ putIn.run([
   'var custom = "test";',
 ]);
 testMe.complete('cus', common.mustCall(function(error, data) {
-  assert.deepStrictEqual(data, [['custom'], 'cus']);
+  assert.deepStrictEqual(data, [['CustomEvent', 'custom'], 'cus']);
 }));
 
 // Make sure tab completion doesn't crash REPL with half-baked proxy objects.
@@ -584,7 +584,7 @@ testMe.complete('obj.', common.mustCall(function(error, data) {
 
     data[0].forEach((key) => {
       if (!key || key === 'ele.biu') return;
-      assert.notStrictEqual(ele[key.substr(4)], undefined);
+      assert.notStrictEqual(ele[key.slice(4)], undefined);
     });
   }));
 });
@@ -632,6 +632,7 @@ const builtins = [
     'Int32Array',
     'Int8Array',
     ...(common.hasIntl ? ['Intl'] : []),
+    'Iterator',
     'inspector',
     'isFinite',
     'isNaN',

@@ -173,6 +173,11 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
 }
 
 // static
+bool OS::RecommitPages(void* address, size_t size, MemoryPermission access) {
+  return SetPermissions(address, size, access);
+}
+
+// static
 bool OS::DiscardSystemPages(void* address, size_t size) {
   // On Windows, discarded pages are not returned to the system immediately and
   // not guaranteed to be zeroed when returned to the application.
@@ -271,10 +276,10 @@ void OS::SignalCodeMovingGC() {
 
 void OS::AdjustSchedulingParams() {}
 
-std::vector<OS::MemoryRange> OS::GetFreeMemoryRangesWithin(
+std::optional<OS::MemoryRange> OS::GetFirstFreeMemoryRangeWithin(
     OS::Address boundary_start, OS::Address boundary_end, size_t minimum_size,
     size_t alignment) {
-  return {};
+  return std::nullopt;
 }
 
 }  // namespace base

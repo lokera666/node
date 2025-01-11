@@ -27,7 +27,7 @@ class ActivityCollector {
     ondestroy,
     onpromiseResolve,
     logid = null,
-    logtype = null
+    logtype = null,
   } = {}) {
     this._start = start;
     this._allowNoInit = allowNoInit;
@@ -49,7 +49,7 @@ class ActivityCollector {
       before: this._before.bind(this),
       after: this._after.bind(this),
       destroy: this._destroy.bind(this),
-      promiseResolve: this._promiseResolve.bind(this)
+      promiseResolve: this._promiseResolve.bind(this),
     });
   }
 
@@ -146,7 +146,7 @@ class ActivityCollector {
 
   _stamp(h, hook) {
     if (h == null) return;
-    if (h[hook] == null) h[hook] = [];
+    h[hook] ??= [];
     const time = process.hrtime(this._start);
     h[hook].push((time[0] * 1e9) + time[1]);
   }
@@ -181,7 +181,7 @@ class ActivityCollector {
       // In some cases (e.g. Timeout) the handle is a function, thus the usual
       // `typeof handle === 'object' && handle !== null` check can't be used.
       handleIsObject: handle instanceof Object,
-      handle
+      handle,
     };
     this._stamp(activity, 'init');
     this._activities.set(uid, activity);
@@ -192,28 +192,28 @@ class ActivityCollector {
   _before(uid) {
     const h = this._getActivity(uid, 'before');
     this._stamp(h, 'before');
-    this._maybeLog(uid, h && h.type, 'before');
+    this._maybeLog(uid, h?.type, 'before');
     this.onbefore(uid);
   }
 
   _after(uid) {
     const h = this._getActivity(uid, 'after');
     this._stamp(h, 'after');
-    this._maybeLog(uid, h && h.type, 'after');
+    this._maybeLog(uid, h?.type, 'after');
     this.onafter(uid);
   }
 
   _destroy(uid) {
     const h = this._getActivity(uid, 'destroy');
     this._stamp(h, 'destroy');
-    this._maybeLog(uid, h && h.type, 'destroy');
+    this._maybeLog(uid, h?.type, 'destroy');
     this.ondestroy(uid);
   }
 
   _promiseResolve(uid) {
     const h = this._getActivity(uid, 'promiseResolve');
     this._stamp(h, 'promiseResolve');
-    this._maybeLog(uid, h && h.type, 'promiseResolve');
+    this._maybeLog(uid, h?.type, 'promiseResolve');
     this.onpromiseResolve(uid);
   }
 
@@ -233,7 +233,7 @@ exports = module.exports = function initHooks({
   onpromiseResolve,
   allowNoInit,
   logid,
-  logtype
+  logtype,
 } = {}) {
   return new ActivityCollector(process.hrtime(), {
     oninit,
@@ -243,6 +243,6 @@ exports = module.exports = function initHooks({
     onpromiseResolve,
     allowNoInit,
     logid,
-    logtype
+    logtype,
   });
 };

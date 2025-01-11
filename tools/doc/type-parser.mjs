@@ -8,13 +8,13 @@ const jsPrimitives = {
   number: 'Number',
   string: 'String',
   symbol: 'Symbol',
-  undefined: 'Undefined'
+  undefined: 'Undefined',
 };
 
 const jsGlobalObjectsUrl = `${jsDocPrefix}Reference/Global_Objects/`;
 const jsGlobalTypes = [
   'AggregateError', 'Array', 'ArrayBuffer', 'DataView', 'Date', 'Error',
-  'EvalError', 'Function', 'Map', 'Object', 'Promise', 'RangeError',
+  'EvalError', 'Function', 'Map', 'Object', 'Promise', 'Proxy', 'RangeError',
   'ReferenceError', 'RegExp', 'Set', 'SharedArrayBuffer', 'SyntaxError',
   'TypeError', 'TypedArray', 'URIError', 'Uint8Array',
 ];
@@ -43,6 +43,7 @@ const customTypesMap = {
     `${jsDocPrefix}Reference/Global_Objects/WebAssembly/Instance`,
 
   'Blob': 'buffer.html#class-blob',
+  'File': 'buffer.html#class-file',
 
   'BroadcastChannel':
     'worker_threads.html#class-broadcastchannel-' +
@@ -55,6 +56,8 @@ const customTypesMap = {
 
   'Module Namespace Object':
     'https://tc39.github.io/ecma262/#sec-module-namespace-exotic-objects',
+
+  'AsyncLocalStorage': 'async_context.html#class-asynclocalstorage',
 
   'AsyncHook': 'async_hooks.html#async_hookscreatehookcallbacks',
   'AsyncResource': 'async_hooks.html#class-asyncresource',
@@ -107,6 +110,7 @@ const customTypesMap = {
   'dgram.Socket': 'dgram.html#class-dgramsocket',
 
   'Channel': 'diagnostics_channel.html#class-channel',
+  'TracingChannel': 'diagnostics_channel.html#class-tracingchannel',
 
   'Domain': 'domain.html#class-domain',
 
@@ -126,6 +130,7 @@ const customTypesMap = {
   'fs.FSWatcher': 'fs.html#class-fsfswatcher',
   'fs.ReadStream': 'fs.html#class-fsreadstream',
   'fs.Stats': 'fs.html#class-fsstats',
+  'fs.StatFs': 'fs.html#class-fsstatfs',
   'fs.StatWatcher': 'fs.html#class-fsstatwatcher',
   'fs.WriteStream': 'fs.html#class-fswritestream',
 
@@ -157,6 +162,8 @@ const customTypesMap = {
   'module.SourceMap':
     'module.html#class-modulesourcemap',
 
+  'MockModuleContext': 'test.html#class-mockmodulecontext',
+
   'require': 'modules.html#requireid',
 
   'Handle': 'net.html#serverlistenhandle-backlog-callback',
@@ -179,7 +186,7 @@ const customTypesMap = {
   'PerformanceNodeTiming':
     'perf_hooks.html#class-performancenodetiming',
   'PerformanceObserver':
-    'perf_hooks.html#class-perf_hooksperformanceobserver',
+    'perf_hooks.html#class-performanceobserver',
   'PerformanceObserverEntryList':
     'perf_hooks.html#class-performanceobserverentrylist',
 
@@ -191,6 +198,9 @@ const customTypesMap = {
     'readline.html#class-readlinepromisesinterface',
 
   'repl.REPLServer': 'repl.html#class-replserver',
+
+  'Session': 'sqlite.html#class-session',
+  'StatementSync': 'sqlite.html#class-statementsync',
 
   'Stream': 'stream.html#stream',
   'stream.Duplex': 'stream.html#class-streamduplex',
@@ -206,18 +216,29 @@ const customTypesMap = {
   'Timeout': 'timers.html#class-timeout',
   'Timer': 'timers.html#timers',
 
+  'TestsStream': 'test.html#class-testsstream',
+
   'tls.SecureContext': 'tls.html#tlscreatesecurecontextoptions',
   'tls.Server': 'tls.html#class-tlsserver',
   'tls.TLSSocket': 'tls.html#class-tlstlssocket',
 
   'Tracing': 'tracing.html#tracing-object',
 
+  'tty.ReadStream': 'tty.html#class-ttyreadstream',
+  'tty.WriteStream': 'tty.html#class-ttywritestream',
+
   'URL': 'url.html#the-whatwg-url-api',
   'URLSearchParams': 'url.html#class-urlsearchparams',
+
+  'MIMEParams': 'util.html#class-utilmimeparams',
 
   'vm.Module': 'vm.html#class-vmmodule',
   'vm.Script': 'vm.html#class-vmscript',
   'vm.SourceTextModule': 'vm.html#class-vmsourcetextmodule',
+  'vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER':
+      'vm.html#vmconstantsuse_main_context_default_loader',
+  'vm.constants.DONT_CONTEXTIFY':
+      'vm.html#vmconstantsdont_contextify',
 
   'MessagePort': 'worker_threads.html#class-messageport',
   'Worker': 'worker_threads.html#class-worker',
@@ -261,6 +282,32 @@ const customTypesMap = {
   'Headers': 'https://developer.mozilla.org/en-US/docs/Web/API/Headers',
   'Response': 'https://developer.mozilla.org/en-US/docs/Web/API/Response',
   'Request': 'https://developer.mozilla.org/en-US/docs/Web/API/Request',
+  'Disposable': 'https://tc39.es/proposal-explicit-resource-management/#sec-disposable-interface',
+
+  'quic.QuicEndpoint': 'quic.html#class-quicendpoint',
+  'quic.QuicEndpoint.Stats': 'quic.html#class-quicendpointstats',
+  'quic.QuicSession': 'quic.html#class-quicsession',
+  'quic.QuicSession.Stats': 'quic.html#class-quicsessionstats',
+  'quic.QuicStream': 'quic.html#class-quicstream',
+  'quic.QuicStream.Stats': 'quic.html#class-quicstreamstats',
+  'quic.EndpointOptions': 'quic.html#type-endpointoptions',
+  'quic.SessionOptions': 'quic.html#type-sessionoptions',
+  'quic.ApplicationOptions': 'quic.html#type-applicationoptions',
+  'quic.TlsOptions': 'quic.html#type-tlsoptions',
+  'quic.TransportParams': 'quic.html#type-transportparams',
+  'quic.OnSessionCallback': 'quic.html#callback-onsessioncallback',
+  'quic.OnStreamCallback': 'quic.html#callback-onstreamcallback',
+  'quic.OnDatagramCallback': 'quic.html#callback-ondatagramcallback',
+  'quic.OnDatagramStatusCallback': 'quic.html#callback-ondatagramstatuscallback',
+  'quic.OnPathValidationCallback': 'quic.html#callback-onpathvalidationcallback',
+  'quic.OnSessionTicketCallback': 'quic.html#callback-onsessionticketcallback',
+  'quic.OnVersionNegotiationCallback': 'quic.html#callback-onversionnegotiationcallback',
+  'quic.OnHandshakeCallback': 'quic.html#callback-onhandshakecallback',
+  'quic.OnBlockedCallback': 'quic.html#callback-onblockedcallback',
+  'quic.OnStreamErrorCallback': 'quic.html#callback-onstreamerrorcallback',
+  'quic.OnHeadersCallback': 'quic.html#callback-onheaderscallback',
+  'quic.OnTrailersCallback': 'quic.html#callback-ontrailerscallback',
+  'quic.OnPullCallback': 'quic.html#callback-onpullcallback',
 };
 
 const arrayPart = /(?:\[])+$/;
@@ -295,8 +342,8 @@ export function toLink(typeInput) {
           `<a href="${typeUrl}" class="type">&lt;${typeTextFull}&gt;</a>`);
       } else {
         throw new Error(
-          `Unrecognized type: '${typeTextFull}'.\n` +
-          `Please, edit the type or update '${import.meta.url}'.`
+          `Unrecognized type: '${typeTextFull}' in '${import.meta.url}'.\n` +
+          'Valid types can be found at https://github.com/nodejs/node/blob/HEAD/tools/doc/type-parser.mjs',
         );
       }
     } else {

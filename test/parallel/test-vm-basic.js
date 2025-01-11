@@ -172,7 +172,30 @@ const vm = require('vm');
       'Received null'
   });
 
-  // vm.compileFunction('', undefined, null);
+  // Test for invalid options type
+  assert.throws(() => {
+    vm.compileFunction('', [], null);
+  }, {
+    name: 'TypeError',
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: 'The "options" argument must be of type object. Received null'
+  });
+
+  assert.throws(() => {
+    vm.compileFunction('', [], 'string');
+  }, {
+    name: 'TypeError',
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: 'The "options" argument must be of type object. Received type string (\'string\')'
+  });
+
+  assert.throws(() => {
+    vm.compileFunction('', [], 123);
+  }, {
+    name: 'TypeError',
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: 'The "options" argument must be of type object. Received type number (123)'
+  });
 
   const optionTypes = {
     'filename': 'string',
@@ -323,13 +346,27 @@ const vm = require('vm');
     global
   );
 
-  // Test compileFunction produceCachedData option
-  const result = vm.compileFunction('console.log("Hello, World!")', [], {
-    produceCachedData: true,
-  });
+  {
+    const source = 'console.log("Hello, World!")';
+    // Test compileFunction produceCachedData option
+    const result = vm.compileFunction(source, [], {
+      produceCachedData: true,
+    });
 
-  assert.ok(result.cachedDataProduced);
-  assert.ok(result.cachedData.length > 0);
+    assert.ok(result.cachedDataProduced);
+    assert.ok(result.cachedData.length > 0);
+
+    // Test compileFunction cachedData consumption
+    const result2 = vm.compileFunction(source, [], {
+      cachedData: result.cachedData
+    });
+    assert.strictEqual(result2.cachedDataRejected, false);
+
+    const result3 = vm.compileFunction('console.log("wrong source")', [], {
+      cachedData: result.cachedData
+    });
+    assert.strictEqual(result3.cachedDataRejected, true);
+  }
 
   // Resetting value
   Error.stackTraceLimit = oldLimit;

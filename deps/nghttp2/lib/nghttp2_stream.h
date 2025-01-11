@@ -90,8 +90,15 @@ typedef enum {
   NGHTTP2_STREAM_FLAG_DEFERRED_USER = 0x08,
   /* bitwise OR of NGHTTP2_STREAM_FLAG_DEFERRED_FLOW_CONTROL and
      NGHTTP2_STREAM_FLAG_DEFERRED_USER. */
-  NGHTTP2_STREAM_FLAG_DEFERRED_ALL = 0x0c
-
+  NGHTTP2_STREAM_FLAG_DEFERRED_ALL = 0x0c,
+  /* Indicates that this stream is not subject to RFC7540
+     priorities scheme. */
+  NGHTTP2_STREAM_FLAG_NO_RFC7540_PRIORITIES = 0x10,
+  /* Ignore client RFC 9218 priority signal. */
+  NGHTTP2_STREAM_FLAG_IGNORE_CLIENT_PRIORITIES = 0x20,
+  /* Indicates that RFC 9113 leading and trailing white spaces
+     validation against a field value is not performed. */
+  NGHTTP2_STREAM_FLAG_NO_RFC9113_LEADING_AND_TRAILING_WS_VALIDATION = 0x40,
 } nghttp2_stream_flag;
 
 /* HTTP related flags to enforce HTTP semantics */
@@ -117,10 +124,9 @@ typedef enum {
   NGHTTP2_HTTP_FLAG_METH_HEAD = 1 << 8,
   NGHTTP2_HTTP_FLAG_METH_OPTIONS = 1 << 9,
   NGHTTP2_HTTP_FLAG_METH_UPGRADE_WORKAROUND = 1 << 10,
-  NGHTTP2_HTTP_FLAG_METH_ALL = NGHTTP2_HTTP_FLAG_METH_CONNECT |
-                               NGHTTP2_HTTP_FLAG_METH_HEAD |
-                               NGHTTP2_HTTP_FLAG_METH_OPTIONS |
-                               NGHTTP2_HTTP_FLAG_METH_UPGRADE_WORKAROUND,
+  NGHTTP2_HTTP_FLAG_METH_ALL =
+    NGHTTP2_HTTP_FLAG_METH_CONNECT | NGHTTP2_HTTP_FLAG_METH_HEAD |
+    NGHTTP2_HTTP_FLAG_METH_OPTIONS | NGHTTP2_HTTP_FLAG_METH_UPGRADE_WORKAROUND,
   /* :path category */
   /* path starts with "/" */
   NGHTTP2_HTTP_FLAG_PATH_REGULAR = 1 << 11,
@@ -132,6 +138,11 @@ typedef enum {
   /* set if final response is expected */
   NGHTTP2_HTTP_FLAG_EXPECT_FINAL_RESPONSE = 1 << 14,
   NGHTTP2_HTTP_FLAG__PROTOCOL = 1 << 15,
+  /* set if priority header field is received */
+  NGHTTP2_HTTP_FLAG_PRIORITY = 1 << 16,
+  /* set if an error is encountered while parsing priority header
+     field */
+  NGHTTP2_HTTP_FLAG_BAD_PRIORITY = 1 << 17,
 } nghttp2_http_flag;
 
 struct nghttp2_stream {
@@ -204,7 +215,7 @@ struct nghttp2_stream {
   /* status code from remote server */
   int16_t status_code;
   /* Bitwise OR of zero or more nghttp2_http_flag values */
-  uint16_t http_flags;
+  uint32_t http_flags;
   /* This is bitwise-OR of 0 or more of nghttp2_stream_flag. */
   uint8_t flags;
   /* Bitwise OR of zero or more nghttp2_shut_flag values */
@@ -218,6 +229,12 @@ struct nghttp2_stream {
      this stream.  The nonzero does not necessarily mean WINDOW_UPDATE
      is not queued. */
   uint8_t window_update_queued;
+  /* extpri is a stream priority produced by nghttp2_extpri_to_uint8
+     used by RFC 9218 extensible priorities. */
+  uint8_t extpri;
+  /* http_extpri is a stream priority received in HTTP request header
+     fields and produced by nghttp2_extpri_to_uint8. */
+  uint8_t http_extpri;
 };
 
 void nghttp2_stream_init(nghttp2_stream *stream, int32_t stream_id,
@@ -240,14 +257,8 @@ void nghttp2_stream_shutdown(nghttp2_stream *stream, nghttp2_shut_flag flag);
  * more of NGHTTP2_STREAM_FLAG_DEFERRED_USER and
  * NGHTTP2_STREAM_FLAG_DEFERRED_FLOW_CONTROL.  The |flags| indicates
  * the reason of this action.
- *
- * This function returns 0 if it succeeds, or one of the following
- * negative error codes:
- *
- * NGHTTP2_ERR_NOMEM
- *     Out of memory
  */
-int nghttp2_stream_defer_item(nghttp2_stream *stream, uint8_t flags);
+void nghttp2_stream_defer_item(nghttp2_stream *stream, uint8_t flags);
 
 /*
  * Put back deferred data in this stream to active state.  The |flags|
@@ -284,8 +295,8 @@ int nghttp2_stream_check_deferred_by_flow_control(nghttp2_stream *stream);
  * overflow.
  */
 int nghttp2_stream_update_remote_initial_window_size(
-    nghttp2_stream *stream, int32_t new_initial_window_size,
-    int32_t old_initial_window_size);
+  nghttp2_stream *stream, int32_t new_initial_window_size,
+  int32_t old_initial_window_size);
 
 /*
  * Updates the local window size with the new value
@@ -296,8 +307,8 @@ int nghttp2_stream_update_remote_initial_window_size(
  * overflow.
  */
 int nghttp2_stream_update_local_initial_window_size(
-    nghttp2_stream *stream, int32_t new_initial_window_size,
-    int32_t old_initial_window_size);
+  nghttp2_stream *stream, int32_t new_initial_window_size,
+  int32_t old_initial_window_size);
 
 /*
  * Call this function if promised stream |stream| is replied with
@@ -361,14 +372,8 @@ int nghttp2_stream_attach_item(nghttp2_stream *stream,
 /*
  * Detaches |stream->item|.  This function does not free
  * |stream->item|.  The caller must free it.
- *
- * This function returns 0 if it succeeds, or one of the following
- * negative error codes:
- *
- * NGHTTP2_ERR_NOMEM
- *     Out of memory
  */
-int nghttp2_stream_detach_item(nghttp2_stream *stream);
+void nghttp2_stream_detach_item(nghttp2_stream *stream);
 
 /*
  * Makes the |stream| depend on the |dep_stream|.  This dependency is

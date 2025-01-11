@@ -667,3 +667,36 @@ testClosed((opts) => new Writable({ write() {}, ...opts }));
     ).end();
   });
 }
+
+{
+  let isCalled = false;
+  const stream = new Duplex({
+    write(chunk, enc, cb) {
+      setImmediate(() => {
+        isCalled = true;
+        cb();
+      });
+    }
+  });
+
+  stream.end('foo');
+
+  finished(stream, { readable: false }, common.mustCall((err) => {
+    assert(!err);
+    assert.strictEqual(isCalled, true);
+    assert.strictEqual(stream._writableState.pendingcb, 0);
+  }));
+}
+
+{
+  const stream = new Duplex({
+    write(chunk, enc, cb) {}
+  });
+
+  stream.end('foo');
+
+  // Simulate an old stream implementation that doesn't have pendingcb
+  delete stream._writableState.pendingcb;
+
+  finished(stream, { readable: false }, common.mustCall());
+}

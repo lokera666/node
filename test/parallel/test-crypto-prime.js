@@ -1,3 +1,4 @@
+// Flags: --expose-internals
 'use strict';
 
 const common = require('../common');
@@ -12,6 +13,8 @@ const {
   checkPrime,
   checkPrimeSync,
 } = require('crypto');
+
+const { Worker } = require('worker_threads');
 
 const { promisify } = require('util');
 const pgeneratePrime = promisify(generatePrime);
@@ -229,14 +232,27 @@ generatePrime(
   });
 });
 
-['hello', {}, []].forEach((i) => {
-  assert.throws(() => checkPrime(2, { checks: i }), {
-    code: 'ERR_INVALID_ARG_TYPE'
-  }, common.mustNotCall());
-  assert.throws(() => checkPrimeSync(2, { checks: i }), {
-    code: 'ERR_INVALID_ARG_TYPE'
+for (const checks of ['hello', {}, []]) {
+  assert.throws(() => checkPrime(2n, { checks }, common.mustNotCall()), {
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: /checks/
   });
-});
+  assert.throws(() => checkPrimeSync(2n, { checks }), {
+    code: 'ERR_INVALID_ARG_TYPE',
+    message: /checks/
+  });
+}
+
+for (const checks of [-(2 ** 31), -1, 2 ** 31, 2 ** 32 - 1, 2 ** 32, 2 ** 50]) {
+  assert.throws(() => checkPrime(2n, { checks }, common.mustNotCall()), {
+    code: 'ERR_OUT_OF_RANGE',
+    message: /<= 2147483647/
+  });
+  assert.throws(() => checkPrimeSync(2n, { checks }), {
+    code: 'ERR_OUT_OF_RANGE',
+    message: /<= 2147483647/
+  });
+}
 
 assert(!checkPrimeSync(Buffer.from([0x1])));
 assert(checkPrimeSync(Buffer.from([0x2])));
@@ -280,4 +296,18 @@ assert.throws(() => {
     assert(checkPrimeSync(prime));
     checkPrime(prime, common.mustSucceed(assert));
   }));
+}
+
+{
+  // Verify that generatePrime can be reasonably interrupted.
+  const worker = new Worker(`
+    const { generatePrime } = require('crypto');
+    generatePrime(2048, () => {
+      throw new Error('should not be called');
+    });
+    process.exit(42);
+  `, { eval: true });
+
+  worker.on('error', common.mustNotCall());
+  worker.on('exit', common.mustCall((exitCode) => assert.strictEqual(exitCode, 42)));
 }

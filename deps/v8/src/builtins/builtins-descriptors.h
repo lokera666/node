@@ -5,10 +5,9 @@
 #ifndef V8_BUILTINS_BUILTINS_DESCRIPTORS_H_
 #define V8_BUILTINS_BUILTINS_DESCRIPTORS_H_
 
-#include "src/builtins/builtins.h"
+#include "src/builtins/builtins-definitions.h"
 #include "src/codegen/interface-descriptors.h"
-#include "src/compiler/code-assembler.h"
-#include "src/objects/shared-function-info.h"
+#include "src/common/globals.h"
 
 namespace v8 {
 namespace internal {
@@ -17,7 +16,7 @@ namespace internal {
 #define DEFINE_TFJ_INTERFACE_DESCRIPTOR(Name, Argc, ...)                 \
   struct Builtin_##Name##_InterfaceDescriptor {                          \
     enum ParameterIndices {                                              \
-      kJSTarget = compiler::CodeAssembler::kTargetParameterIndex,        \
+      kJSTarget = kJSCallClosureParameterIndex,                          \
       ##__VA_ARGS__,                                                     \
       kJSNewTarget,                                                      \
       kJSActualArgumentsCount,                                           \
@@ -29,6 +28,12 @@ namespace internal {
                   "Inconsistent set of arguments");                      \
     static_assert(kJSTarget == -1, "Unexpected kJSTarget index value");  \
   };
+
+#define DEFINE_TSJ_INTERFACE_DESCRIPTOR(...) \
+  DEFINE_TFJ_INTERFACE_DESCRIPTOR(__VA_ARGS__)
+
+#define DEFINE_TSC_INTERFACE_DESCRIPTOR(Name, InterfaceDescriptor) \
+  using Builtin_##Name##_InterfaceDescriptor = InterfaceDescriptor##Descriptor;
 
 // Define interface descriptors for builtins with StubCall linkage.
 #define DEFINE_TFC_INTERFACE_DESCRIPTOR(Name, InterfaceDescriptor) \
@@ -44,12 +49,15 @@ namespace internal {
 #define DEFINE_ASM_INTERFACE_DESCRIPTOR(Name, InterfaceDescriptor) \
   using Builtin_##Name##_InterfaceDescriptor = InterfaceDescriptor##Descriptor;
 
-BUILTIN_LIST(IGNORE_BUILTIN, DEFINE_TFJ_INTERFACE_DESCRIPTOR,
+BUILTIN_LIST(IGNORE_BUILTIN, DEFINE_TSJ_INTERFACE_DESCRIPTOR,
+             DEFINE_TFJ_INTERFACE_DESCRIPTOR, DEFINE_TSC_INTERFACE_DESCRIPTOR,
              DEFINE_TFC_INTERFACE_DESCRIPTOR, DEFINE_TFS_INTERFACE_DESCRIPTOR,
              DEFINE_TFH_INTERFACE_DESCRIPTOR, IGNORE_BUILTIN,
              DEFINE_ASM_INTERFACE_DESCRIPTOR)
 
 #undef DEFINE_TFJ_INTERFACE_DESCRIPTOR
+#undef DEFINE_TSJ_INTERFACE_DESCRIPTOR
+#undef DEFINE_TSC_INTERFACE_DESCRIPTOR
 #undef DEFINE_TFC_INTERFACE_DESCRIPTOR
 #undef DEFINE_TFS_INTERFACE_DESCRIPTOR
 #undef DEFINE_TFH_INTERFACE_DESCRIPTOR

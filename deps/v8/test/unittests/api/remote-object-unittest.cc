@@ -7,7 +7,6 @@
 #include "include/v8-primitive.h"
 #include "include/v8-template.h"
 #include "src/api/api-inl.h"
-#include "src/handles/handles.h"
 #include "src/objects/objects-inl.h"
 #include "test/unittests/test-utils.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -24,8 +23,10 @@ bool AccessCheck(Local<Context> accessing_context,
   return false;
 }
 
-void NamedGetter(Local<Name> property,
-                 const PropertyCallbackInfo<Value>& info) {}
+v8::Intercepted NamedGetter(Local<Name> property,
+                            const PropertyCallbackInfo<Value>& info) {
+  return v8::Intercepted::kNo;
+}
 
 void Constructor(const FunctionCallbackInfo<Value>& info) {
   ASSERT_TRUE(info.IsConstructCall());

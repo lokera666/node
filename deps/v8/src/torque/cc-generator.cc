@@ -4,17 +4,17 @@
 
 #include "src/torque/cc-generator.h"
 
+#include <optional>
+
 #include "src/common/globals.h"
 #include "src/torque/global-context.h"
 #include "src/torque/type-oracle.h"
 #include "src/torque/types.h"
 #include "src/torque/utils.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+namespace v8::internal::torque {
 
-base::Optional<Stack<std::string>> CCGenerator::EmitGraph(
+std::optional<Stack<std::string>> CCGenerator::EmitGraph(
     Stack<std::string> parameters) {
   for (BottomOffset i = {0}; i < parameters.AboveTop(); ++i) {
     SetDefinitionVariable(DefinitionLocation::Parameter(i.offset),
@@ -35,7 +35,7 @@ base::Optional<Stack<std::string>> CCGenerator::EmitGraph(
     EmitBlock(block);
   }
 
-  base::Optional<Stack<std::string>> result;
+  std::optional<Stack<std::string>> result;
   if (cfg_.end()) {
     result = EmitBlock(*cfg_.end());
   }
@@ -328,10 +328,9 @@ void CCGenerator::EmitInstruction(const ReturnInstruction& instruction,
   ReportError("Not supported in C++ output: Return");
 }
 
-void CCGenerator::EmitInstruction(
-    const PrintConstantStringInstruction& instruction,
-    Stack<std::string>* stack) {
-  out() << "  std::cout << " << StringLiteralQuote(instruction.message)
+void CCGenerator::EmitInstruction(const PrintErrorInstruction& instruction,
+                                  Stack<std::string>* stack) {
+  out() << "  std::cerr << " << StringLiteralQuote(instruction.message)
         << ";\n";
 }
 
@@ -399,10 +398,10 @@ void CCGenerator::EmitInstruction(const LoadReferenceInstruction& instruction,
       // HeapObject|TaggedZeroPattern, which is output as "Object". TaggedField
       // requires HeapObject, so we need a cast.
       out() << "TaggedField<" << result_type
-            << ">::load(*static_cast<HeapObject*>(&" << object
+            << ">::load(UncheckedCast<HeapObject>(" << object
             << "), static_cast<int>(" << offset << "));\n";
     } else {
-      out() << "(" << object << ").ReadField<" << result_type << ">(" << offset
+      out() << "(" << object << ")->ReadField<" << result_type << ">(" << offset
             << ");\n";
     }
   } else {
@@ -449,7 +448,7 @@ void CCGenerator::EmitInstruction(const LoadBitFieldInstruction& instruction,
   decls() << "  " << instruction.bit_field.name_and_type.type->GetRuntimeType()
           << " " << result_name << "{}; USE(" << result_name << ");\n";
 
-  base::Optional<const Type*> smi_tagged_type =
+  std::optional<const Type*> smi_tagged_type =
       Type::MatchUnaryGeneric(struct_type, TypeOracle::GetSmiTaggedGeneric());
   if (smi_tagged_type) {
     // Get the untagged value and its type.
@@ -506,6 +505,4 @@ void CCGenerator::EmitCCValue(VisitResult result,
   }
 }
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::torque

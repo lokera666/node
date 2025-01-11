@@ -4,10 +4,12 @@
 #include "env-inl.h"
 #include "memory_tracker-inl.h"
 #include "node.h"
+#include "node_dotenv.h"
 #include "node_errors.h"
 #include "node_external_reference.h"
 #include "node_internals.h"
 #include "node_process-inl.h"
+#include "path.h"
 #include "util-inl.h"
 #include "uv.h"
 #include "v8-fast-api-calls.h"
@@ -40,14 +42,17 @@ using v8::ArrayBuffer;
 using v8::CFunction;
 using v8::Context;
 using v8::Float64Array;
+using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::HeapStatistics;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::Maybe;
 using v8::NewStringType;
 using v8::Number;
 using v8::Object;
+using v8::ObjectTemplate;
 using v8::String;
 using v8::Uint32;
 using v8::Value;
@@ -62,13 +67,13 @@ Mutex umask_mutex;
 #define NANOS_PER_SEC 1000000000
 
 static void Abort(const FunctionCallbackInfo<Value>& args) {
-  Abort();
+  ABORT();
 }
 
 // For internal testing only, not exposed to userland.
 static void CauseSegfault(const FunctionCallbackInfo<Value>& args) {
   // This should crash hard all platforms.
-  volatile void** d = static_cast<volatile void**>(nullptr);
+  void* volatile* d = static_cast<void* volatile*>(nullptr);
   *d = nullptr;
 }
 
@@ -79,6 +84,8 @@ static void Chdir(const FunctionCallbackInfo<Value>& args) {
   CHECK_EQ(args.Length(), 1);
   CHECK(args[0]->IsString());
   Utf8Value path(env->isolate(), args[0]);
+  THROW_IF_INSUFFICIENT_PERMISSIONS(
+      env, permission::PermissionScope::kFileSystemRead, path.ToStringView());
   int err = uv_chdir(*path);
   if (err) {
     // Also include the original working directory, since that will usually
@@ -116,7 +123,7 @@ static void CPUUsage(const FunctionCallbackInfo<Value>& args) {
 
   // Get the double array pointer from the Float64Array argument.
   Local<ArrayBuffer> ab = get_fields_array_buffer(args, 0, 2);
-  double* fields = static_cast<double*>(ab->GetBackingStore()->Data());
+  double* fields = static_cast<double*>(ab->Data());
 
   // Set the Float64Array elements to be user / system values in microseconds.
   fields[0] = MICROS_PER_SEC * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec;
@@ -189,7 +196,7 @@ static void MemoryUsage(const FunctionCallbackInfo<Value>& args) {
 
   // Get the double array pointer from the Float64Array argument.
   Local<ArrayBuffer> ab = get_fields_array_buffer(args, 0, 5);
-  double* fields = static_cast<double*>(ab->GetBackingStore()->Data());
+  double* fields = static_cast<double*>(ab->Data());
 
   size_t rss;
   int err = uv_resident_set_memory(&rss);
@@ -204,6 +211,16 @@ static void MemoryUsage(const FunctionCallbackInfo<Value>& args) {
       array_buffer_allocator == nullptr
           ? 0
           : static_cast<double>(array_buffer_allocator->total_mem_usage());
+}
+
+static void GetConstrainedMemory(const FunctionCallbackInfo<Value>& args) {
+  uint64_t value = uv_get_constrained_memory();
+  args.GetReturnValue().Set(static_cast<double>(value));
+}
+
+static void GetAvailableMemory(const FunctionCallbackInfo<Value>& args) {
+  uint64_t value = uv_get_available_memory();
+  args.GetReturnValue().Set(static_cast<double>(value));
 }
 
 void RawDebug(const FunctionCallbackInfo<Value>& args) {
@@ -258,21 +275,6 @@ static void GetActiveRequests(const FunctionCallbackInfo<Value>& args) {
       Array::New(env->isolate(), request_v.data(), request_v.size()));
 }
 
-static void GetActiveRequestsInfo(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-
-  std::vector<Local<Value>> requests_info;
-  for (ReqWrapBase* req_wrap : *env->req_wrap_queue()) {
-    AsyncWrap* w = req_wrap->GetAsyncWrap();
-    if (w->persistent().IsEmpty()) continue;
-    requests_info.emplace_back(OneByteString(env->isolate(),
-                               w->MemoryInfoName().c_str()));
-  }
-
-  args.GetReturnValue().Set(
-      Array::New(env->isolate(), requests_info.data(), requests_info.size()));
-}
-
 // Non-static, friend of HandleWrap. Could have been a HandleWrap method but
 // implemented here for consistency with GetActiveRequests().
 void GetActiveHandles(const FunctionCallbackInfo<Value>& args) {
@@ -288,18 +290,37 @@ void GetActiveHandles(const FunctionCallbackInfo<Value>& args) {
       Array::New(env->isolate(), handle_v.data(), handle_v.size()));
 }
 
-void GetActiveHandlesInfo(const FunctionCallbackInfo<Value>& args) {
+static void GetActiveResourcesInfo(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
+  std::vector<Local<Value>> resources_info;
 
-  std::vector<Local<Value>> handles_info;
-  for (HandleWrap* w : *env->handle_wrap_queue()) {
-    if (w->persistent().IsEmpty() || !HandleWrap::HasRef(w)) continue;
-    handles_info.emplace_back(OneByteString(env->isolate(),
-                              w->MemoryInfoName().c_str()));
+  // Active requests
+  for (ReqWrapBase* req_wrap : *env->req_wrap_queue()) {
+    AsyncWrap* w = req_wrap->GetAsyncWrap();
+    if (w->persistent().IsEmpty()) continue;
+    resources_info.emplace_back(
+        OneByteString(env->isolate(), w->MemoryInfoName()));
   }
 
+  // Active handles
+  for (HandleWrap* w : *env->handle_wrap_queue()) {
+    if (w->persistent().IsEmpty() || !HandleWrap::HasRef(w)) continue;
+    resources_info.emplace_back(
+        OneByteString(env->isolate(), w->MemoryInfoName()));
+  }
+
+  // Active timeouts
+  resources_info.insert(resources_info.end(),
+                        env->timeout_info()[0],
+                        FIXED_ONE_BYTE_STRING(env->isolate(), "Timeout"));
+
+  // Active immediates
+  resources_info.insert(resources_info.end(),
+                        env->immediate_info()->ref_count(),
+                        FIXED_ONE_BYTE_STRING(env->isolate(), "Immediate"));
+
   args.GetReturnValue().Set(
-      Array::New(env->isolate(), handles_info.data(), handles_info.size()));
+      Array::New(env->isolate(), resources_info.data(), resources_info.size()));
 }
 
 static void ResourceUsage(const FunctionCallbackInfo<Value>& args) {
@@ -311,7 +332,7 @@ static void ResourceUsage(const FunctionCallbackInfo<Value>& args) {
     return env->ThrowUVException(err, "uv_getrusage");
 
   Local<ArrayBuffer> ab = get_fields_array_buffer(args, 0, 16);
-  double* fields = static_cast<double*>(ab->GetBackingStore()->Data());
+  double* fields = static_cast<double*>(ab->Data());
 
   fields[0] = MICROS_PER_SEC * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec;
   fields[1] = MICROS_PER_SEC * rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec;
@@ -442,30 +463,82 @@ static void DebugEnd(const FunctionCallbackInfo<Value>& args) {
 static void ReallyExit(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   RunAtExit(env);
-  int code = args[0]->Int32Value(env->context()).FromMaybe(0);
+  ExitCode code = ExitCode::kNoFailure;
+  Maybe<int32_t> code_int = args[0]->Int32Value(env->context());
+  if (!code_int.IsNothing()) {
+    code = static_cast<ExitCode>(code_int.FromJust());
+  }
   env->Exit(code);
+}
+
+static void LoadEnvFile(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  std::string path = ".env";
+  if (args.Length() == 1) {
+    BufferValue path_value(args.GetIsolate(), args[0]);
+    ToNamespacedPath(env, &path_value);
+    path = path_value.ToString();
+  }
+
+  THROW_IF_INSUFFICIENT_PERMISSIONS(
+      env, permission::PermissionScope::kFileSystemRead, path);
+
+  Dotenv dotenv{};
+
+  switch (dotenv.ParsePath(path)) {
+    case dotenv.ParseResult::Valid: {
+      dotenv.SetEnvironment(env);
+      break;
+    }
+    case dotenv.ParseResult::InvalidContent: {
+      THROW_ERR_INVALID_ARG_TYPE(
+          env, "Contents of '%s' should be a valid string.", path.c_str());
+      break;
+    }
+    case dotenv.ParseResult::FileError: {
+      env->ThrowUVException(UV_ENOENT, "open", nullptr, path.c_str());
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
 }
 
 namespace process {
 
-BindingData::BindingData(Environment* env, v8::Local<v8::Object> object)
-    : SnapshotableObject(env, object, type_int) {
-  Local<ArrayBuffer> ab = ArrayBuffer::New(env->isolate(), kBufferSize);
-  array_buffer_.Reset(env->isolate(), ab);
-  object
-      ->Set(env->context(),
-            FIXED_ONE_BYTE_STRING(env->isolate(), "hrtimeBuffer"),
-            ab)
-      .ToChecked();
-  backing_store_ = ab->GetBackingStore();
+BindingData::BindingData(Realm* realm,
+                         v8::Local<v8::Object> object,
+                         InternalFieldInfo* info)
+    : SnapshotableObject(realm, object, type_int),
+      hrtime_buffer_(realm->isolate(),
+                     kHrTimeBufferLength,
+                     MAYBE_FIELD_PTR(info, hrtime_buffer)) {
+  Isolate* isolate = realm->isolate();
+  Local<Context> context = realm->context();
+
+  if (info == nullptr) {
+    object
+        ->Set(context,
+              FIXED_ONE_BYTE_STRING(isolate, "hrtimeBuffer"),
+              hrtime_buffer_.GetJSArray())
+        .ToChecked();
+  } else {
+    hrtime_buffer_.Deserialize(realm->context());
+  }
+
+  // The hrtime buffer is referenced from the binding data js object.
+  // Make the native handle weak to avoid keeping the realm alive.
+  hrtime_buffer_.MakeWeak();
 }
 
 v8::CFunction BindingData::fast_number_(v8::CFunction::Make(FastNumber));
 v8::CFunction BindingData::fast_bigint_(v8::CFunction::Make(FastBigInt));
 
-void BindingData::AddMethods() {
-  env()->SetFastMethod(object(), "hrtime", SlowNumber, &fast_number_);
-  env()->SetFastMethod(object(), "hrtimeBigInt", SlowBigInt, &fast_bigint_);
+void BindingData::AddMethods(Isolate* isolate, Local<ObjectTemplate> target) {
+  SetFastMethodNoSideEffect(
+      isolate, target, "hrtime", SlowNumber, &fast_number_);
+  SetFastMethodNoSideEffect(
+      isolate, target, "hrtimeBigInt", SlowBigInt, &fast_bigint_);
 }
 
 void BindingData::RegisterExternalReferences(
@@ -485,7 +558,7 @@ BindingData* BindingData::FromV8Value(Local<Value> value) {
 }
 
 void BindingData::MemoryInfo(MemoryTracker* tracker) const {
-  tracker->TrackField("array_buffer", array_buffer_);
+  tracker->TrackField("hrtime_buffer", hrtime_buffer_);
 }
 
 // This is the legacy version of hrtime before BigInt was introduced in
@@ -498,93 +571,111 @@ void BindingData::MemoryInfo(MemoryTracker* tracker) const {
 // because there is no Uint64Array in JS.
 // The third entry contains the remaining nanosecond part of the value.
 void BindingData::NumberImpl(BindingData* receiver) {
-  // Make sure we don't accidentally access buffers wiped for snapshot.
-  CHECK(!receiver->array_buffer_.IsEmpty());
   uint64_t t = uv_hrtime();
-  uint32_t* fields = static_cast<uint32_t*>(receiver->backing_store_->Data());
-  fields[0] = (t / NANOS_PER_SEC) >> 32;
-  fields[1] = (t / NANOS_PER_SEC) & 0xffffffff;
-  fields[2] = t % NANOS_PER_SEC;
+  receiver->hrtime_buffer_[0] = (t / NANOS_PER_SEC) >> 32;
+  receiver->hrtime_buffer_[1] = (t / NANOS_PER_SEC) & 0xffffffff;
+  receiver->hrtime_buffer_[2] = t % NANOS_PER_SEC;
 }
 
 void BindingData::BigIntImpl(BindingData* receiver) {
-  // Make sure we don't accidentally access buffers wiped for snapshot.
-  CHECK(!receiver->array_buffer_.IsEmpty());
   uint64_t t = uv_hrtime();
-  uint64_t* fields = static_cast<uint64_t*>(receiver->backing_store_->Data());
+  // The buffer is a Uint32Array, so we need to reinterpret it as a
+  // Uint64Array to write the value. The buffer is valid at this scope so we
+  // can safely cast away the constness.
+  uint64_t* fields = reinterpret_cast<uint64_t*>(
+      const_cast<uint32_t*>(receiver->hrtime_buffer_.GetNativeBuffer()));
   fields[0] = t;
 }
 
 void BindingData::SlowBigInt(const FunctionCallbackInfo<Value>& args) {
-  BigIntImpl(FromJSObject<BindingData>(args.Holder()));
+  BigIntImpl(FromJSObject<BindingData>(args.This()));
 }
 
 void BindingData::SlowNumber(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  NumberImpl(FromJSObject<BindingData>(args.Holder()));
+  NumberImpl(FromJSObject<BindingData>(args.This()));
 }
 
-void BindingData::PrepareForSerialization(Local<Context> context,
+bool BindingData::PrepareForSerialization(Local<Context> context,
                                           v8::SnapshotCreator* creator) {
-  // It's not worth keeping.
-  // Release it, we will recreate it when the instance is dehydrated.
-  array_buffer_.Reset();
+  DCHECK_NULL(internal_field_info_);
+  internal_field_info_ = InternalFieldInfoBase::New<InternalFieldInfo>(type());
+  internal_field_info_->hrtime_buffer =
+      hrtime_buffer_.Serialize(context, creator);
+  // Return true because we need to maintain the reference to the binding from
+  // JS land.
+  return true;
 }
 
-InternalFieldInfo* BindingData::Serialize(int index) {
-  DCHECK_EQ(index, BaseObject::kSlot);
-  InternalFieldInfo* info = InternalFieldInfo::New(type());
+InternalFieldInfoBase* BindingData::Serialize(int index) {
+  DCHECK_IS_SNAPSHOT_SLOT(index);
+  InternalFieldInfo* info = internal_field_info_;
+  internal_field_info_ = nullptr;
   return info;
 }
 
 void BindingData::Deserialize(Local<Context> context,
                               Local<Object> holder,
                               int index,
-                              InternalFieldInfo* info) {
-  DCHECK_EQ(index, BaseObject::kSlot);
+                              InternalFieldInfoBase* info) {
+  DCHECK_IS_SNAPSHOT_SLOT(index);
   v8::HandleScope scope(context->GetIsolate());
-  Environment* env = Environment::GetCurrent(context);
+  Realm* realm = Realm::GetCurrent(context);
   // Recreate the buffer in the constructor.
-  BindingData* binding = env->AddBindingData<BindingData>(context, holder);
+  InternalFieldInfo* casted_info = static_cast<InternalFieldInfo*>(info);
+  BindingData* binding =
+      realm->AddBindingData<BindingData>(holder, casted_info);
   CHECK_NOT_NULL(binding);
 }
 
-static void Initialize(Local<Object> target,
-                       Local<Value> unused,
-                       Local<Context> context,
-                       void* priv) {
-  Environment* env = Environment::GetCurrent(context);
-  BindingData* const binding_data =
-      env->AddBindingData<BindingData>(context, target);
-  if (binding_data == nullptr) return;
-  binding_data->AddMethods();
+static void SetEmitWarningSync(const FunctionCallbackInfo<Value>& args) {
+  CHECK(args[0]->IsFunction());
+  Environment* env = Environment::GetCurrent(args);
+  env->set_process_emit_warning_sync(args[0].As<Function>());
+}
 
+static void CreatePerIsolateProperties(IsolateData* isolate_data,
+                                       Local<ObjectTemplate> target) {
+  Isolate* isolate = isolate_data->isolate();
+
+  BindingData::AddMethods(isolate, target);
   // define various internal methods
-  if (env->owns_process_state()) {
-    env->SetMethod(target, "_debugProcess", DebugProcess);
-    env->SetMethod(target, "_debugEnd", DebugEnd);
-    env->SetMethod(target, "abort", Abort);
-    env->SetMethod(target, "causeSegfault", CauseSegfault);
-    env->SetMethod(target, "chdir", Chdir);
-  }
+  SetMethod(isolate, target, "_debugProcess", DebugProcess);
+  SetMethod(isolate, target, "abort", Abort);
+  SetMethod(isolate, target, "causeSegfault", CauseSegfault);
+  SetMethod(isolate, target, "chdir", Chdir);
 
-  env->SetMethod(target, "umask", Umask);
-  env->SetMethod(target, "_rawDebug", RawDebug);
-  env->SetMethod(target, "memoryUsage", MemoryUsage);
-  env->SetMethod(target, "rss", Rss);
-  env->SetMethod(target, "cpuUsage", CPUUsage);
-  env->SetMethod(target, "resourceUsage", ResourceUsage);
+  SetMethod(isolate, target, "umask", Umask);
+  SetMethod(isolate, target, "memoryUsage", MemoryUsage);
+  SetMethod(isolate, target, "constrainedMemory", GetConstrainedMemory);
+  SetMethod(isolate, target, "availableMemory", GetAvailableMemory);
+  SetMethod(isolate, target, "rss", Rss);
+  SetMethod(isolate, target, "cpuUsage", CPUUsage);
+  SetMethod(isolate, target, "resourceUsage", ResourceUsage);
 
-  env->SetMethod(target, "_getActiveRequests", GetActiveRequests);
-  env->SetMethod(target, "_getActiveRequestsInfo", GetActiveRequestsInfo);
-  env->SetMethod(target, "_getActiveHandles", GetActiveHandles);
-  env->SetMethod(target, "_getActiveHandlesInfo", GetActiveHandlesInfo);
-  env->SetMethod(target, "_kill", Kill);
+  SetMethod(isolate, target, "_debugEnd", DebugEnd);
+  SetMethod(isolate, target, "_getActiveRequests", GetActiveRequests);
+  SetMethod(isolate, target, "_getActiveHandles", GetActiveHandles);
+  SetMethod(isolate, target, "getActiveResourcesInfo", GetActiveResourcesInfo);
+  SetMethod(isolate, target, "_kill", Kill);
+  SetMethod(isolate, target, "_rawDebug", RawDebug);
 
-  env->SetMethodNoSideEffect(target, "cwd", Cwd);
-  env->SetMethod(target, "dlopen", binding::DLOpen);
-  env->SetMethod(target, "reallyExit", ReallyExit);
-  env->SetMethodNoSideEffect(target, "uptime", Uptime);
-  env->SetMethod(target, "patchProcessObject", PatchProcessObject);
+  SetMethodNoSideEffect(isolate, target, "cwd", Cwd);
+  SetMethod(isolate, target, "dlopen", binding::DLOpen);
+  SetMethod(isolate, target, "reallyExit", ReallyExit);
+  SetMethodNoSideEffect(isolate, target, "uptime", Uptime);
+  SetMethod(isolate, target, "patchProcessObject", PatchProcessObject);
+
+  SetMethod(isolate, target, "loadEnvFile", LoadEnvFile);
+
+  SetMethod(isolate, target, "setEmitWarningSync", SetEmitWarningSync);
+}
+
+static void CreatePerContextProperties(Local<Object> target,
+                                       Local<Value> unused,
+                                       Local<Context> context,
+                                       void* priv) {
+  Realm* realm = Realm::GetCurrent(context);
+  realm->AddBindingData<BindingData>(target);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -599,14 +690,15 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(Umask);
   registry->Register(RawDebug);
   registry->Register(MemoryUsage);
+  registry->Register(GetConstrainedMemory);
+  registry->Register(GetAvailableMemory);
   registry->Register(Rss);
   registry->Register(CPUUsage);
   registry->Register(ResourceUsage);
 
   registry->Register(GetActiveRequests);
-  registry->Register(GetActiveRequestsInfo);
   registry->Register(GetActiveHandles);
-  registry->Register(GetActiveHandlesInfo);
+  registry->Register(GetActiveResourcesInfo);
   registry->Register(Kill);
 
   registry->Register(Cwd);
@@ -614,11 +706,18 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(ReallyExit);
   registry->Register(Uptime);
   registry->Register(PatchProcessObject);
+
+  registry->Register(LoadEnvFile);
+
+  registry->Register(SetEmitWarningSync);
 }
 
 }  // namespace process
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(process_methods, node::process::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(process_methods,
-                               node::process::RegisterExternalReferences)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(process_methods,
+                                    node::process::CreatePerContextProperties)
+NODE_BINDING_PER_ISOLATE_INIT(process_methods,
+                              node::process::CreatePerIsolateProperties)
+NODE_BINDING_EXTERNAL_REFERENCE(process_methods,
+                                node::process::RegisterExternalReferences)

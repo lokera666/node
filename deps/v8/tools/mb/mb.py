@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright 2016 the V8 project authors. All rights reserved.
 # Copyright 2015 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
@@ -38,8 +38,6 @@ try:
 except ImportError:
   from urllib2 import urlopen
 
-from collections import OrderedDict
-
 CHROMIUM_SRC_DIR = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 sys.path = [os.path.join(CHROMIUM_SRC_DIR, 'build')] + sys.path
@@ -66,9 +64,9 @@ def _v8_builder_fallback(builder, builder_group):
   elif builder.endswith(' builder'):
     builders.append(builder[:-len(' builder')])
 
-  for builder in builders:
-    if builder in builder_group:
-      return builder_group[builder]
+  for b in builders:
+    if b in builder_group:
+      return builder_group[b]
   return None
 
 
@@ -77,7 +75,7 @@ def main(args):
   return mbw.Main(args)
 
 
-class MetaBuildWrapper(object):
+class MetaBuildWrapper():
   def __init__(self):
     self.chromium_src_dir = CHROMIUM_SRC_DIR
     self.default_config = os.path.join(self.chromium_src_dir, 'infra', 'mb',
@@ -129,16 +127,18 @@ class MetaBuildWrapper(object):
                         default=self.default_config,
                         help='path to config file '
                              '(default is %(default)s)')
-      subp.add_argument('-i', '--isolate-map-file', metavar='PATH',
-                        help='path to isolate map file '
-                             '(default is %(default)s)',
-                        default=[],
-                        action='append',
-                        dest='isolate_map_files')
-      subp.add_argument('-g', '--goma-dir',
-                        help='path to goma directory')
-      subp.add_argument('--android-version-code',
-                        help='Sets GN arg android_default_version_code')
+      subp.add_argument(
+          '-i',
+          '--isolate-map-file',
+          metavar='PATH',
+          help='path to isolate map file '
+          '(default is %(default)s)',
+          default=[],
+          action='append',
+          dest='isolate_map_files')
+      subp.add_argument(
+          '--android-version-code',
+          help='Sets GN arg android_default_version_code')
       subp.add_argument('--android-version-name',
                         help='Sets GN arg android_default_version_name')
       subp.add_argument('-n', '--dryrun', action='store_true',
@@ -169,11 +169,12 @@ class MetaBuildWrapper(object):
     subp = subps.add_parser('export',
                             help='print out the expanded configuration for'
                                  'each builder as a JSON object')
-    subp.add_argument('-f', '--config-file', metavar='PATH',
-                      default=self.default_config,
-                      help='path to config file (default is %(default)s)')
-    subp.add_argument('-g', '--goma-dir',
-                      help='path to goma directory')
+    subp.add_argument(
+        '-f',
+        '--config-file',
+        metavar='PATH',
+        default=self.default_config,
+        help='path to config file (default is %(default)s)')
     subp.set_defaults(func=self.CmdExport)
 
     subp = subps.add_parser('gen',
@@ -562,7 +563,7 @@ class MetaBuildWrapper(object):
       contents = ast.literal_eval(self.ReadFile(self.args.config_file))
     except SyntaxError as e:
       raise MBErr('Failed to parse config file "%s": %s' %
-                 (self.args.config_file, e))
+                 (self.args.config_file, e)) from e
 
     self.configs = contents['configs']
     self.luci_tryservers = contents.get('luci_tryservers', {})
@@ -587,8 +588,8 @@ class MetaBuildWrapper(object):
               ', '.join(duplicates))
         isolate_maps.update(isolate_map)
       except SyntaxError as e:
-        raise MBErr(
-            'Failed to parse isolate map file "%s": %s' % (isolate_map, e))
+        raise MBErr('Failed to parse isolate map file "%s": %s' %
+                    (isolate_map, e)) from e
     return isolate_maps
 
   def ConfigFromArgs(self):
@@ -659,9 +660,9 @@ class MetaBuildWrapper(object):
         vals['cros_passthrough'] = mixin_vals['cros_passthrough']
       if 'args_file' in mixin_vals:
         if vals['args_file']:
-            raise MBErr('args_file specified multiple times in mixins '
-                        'for %s on %s' %
-                        (self.args.builder, self.args.builder_group))
+          raise MBErr('args_file specified multiple times in mixins '
+                      'for %s on %s' %
+                      (self.args.builder, self.args.builder_group))
         vals['args_file'] = mixin_vals['args_file']
       if 'gn_args' in mixin_vals:
         if vals['gn_args']:
@@ -703,7 +704,7 @@ class MetaBuildWrapper(object):
       isolate_map = self.ReadIsolateMap()
       err, labels = self.MapTargetsToLabels(isolate_map, swarming_targets)
       if err:
-          raise MBErr(err)
+        raise MBErr(err)
 
       gn_runtime_deps_path = self.ToAbsPath(build_dir, 'runtime_deps')
       self.WriteFile(gn_runtime_deps_path, '\n'.join(labels) + '\n')
@@ -711,13 +712,13 @@ class MetaBuildWrapper(object):
 
     ret, output, _ = self.Run(cmd)
     if ret:
-        if self.args.json_output:
-          # write errors to json.output
-          self.WriteJSON({'output': output}, self.args.json_output)
-        # If `gn gen` failed, we should exit early rather than trying to
-        # generate isolates. Run() will have already logged any error output.
-        self.Print('GN gen failed: %d' % ret)
-        return ret
+      if self.args.json_output:
+        # write errors to json.output
+        self.WriteJSON({'output': output}, self.args.json_output)
+      # If `gn gen` failed, we should exit early rather than trying to
+      # generate isolates. Run() will have already logged any error output.
+      self.Print('GN gen failed: %d' % ret)
+      return ret
 
     android = 'target_os="android"' in vals['gn_args']
     for target in swarming_targets:
@@ -862,9 +863,6 @@ class MetaBuildWrapper(object):
                     gn_args)
     else:
       gn_args = vals['gn_args']
-
-    if self.args.goma_dir:
-      gn_args += ' goma_dir="%s"' % self.args.goma_dir
 
     android_version_code = self.args.android_version_code
     if android_version_code:
@@ -1071,7 +1069,7 @@ class MetaBuildWrapper(object):
                      force_verbose=force_verbose)
     except Exception as e:
       raise MBErr('Error %s writing to the output path "%s"' %
-                 (e, path))
+                 (e, path)) from e
 
   def CheckCompile(self, builder_group, builder):
     url_template = self.args.url_template + '/{builder}/builds/_all?as_text=1'
@@ -1089,7 +1087,7 @@ class MetaBuildWrapper(object):
     if not successes:
       return "no successful builds"
     build = builds[str(successes[0])]
-    step_names = set([step["name"] for step in build["steps"]])
+    step_names = {step["name"] for step in build["steps"]}
     compile_indicators = set(["compile", "compile (with patch)", "analyze"])
     if compile_indicators & step_names:
       return "compiles"

@@ -4,15 +4,15 @@
 
 #include "src/torque/declaration-visitor.h"
 
+#include <optional>
+
 #include "src/torque/ast.h"
 #include "src/torque/kythe-data.h"
 #include "src/torque/server-data.h"
 #include "src/torque/type-inference.h"
 #include "src/torque/type-visitor.h"
 
-namespace v8 {
-namespace internal {
-namespace torque {
+namespace v8::internal::torque {
 
 Namespace* GetOrCreateNamespace(const std::string& name) {
   std::vector<Namespace*> existing_namespaces = FilterDeclarables<Namespace>(
@@ -62,12 +62,18 @@ Builtin* DeclarationVisitor::CreateBuiltin(BuiltinDeclaration* decl,
                                            std::string external_name,
                                            std::string readable_name,
                                            Signature signature,
-                                           base::Optional<Statement*> body) {
+                                           std::optional<Statement*> body) {
   const bool javascript = decl->javascript_linkage;
   const bool varargs = decl->parameters.has_varargs;
   Builtin::Kind kind = !javascript ? Builtin::kStub
                                    : varargs ? Builtin::kVarArgsJavaScript
                                              : Builtin::kFixedArgsJavaScript;
+  bool has_custom_interface_descriptor = false;
+  if (decl->kind == AstNode::Kind::kTorqueBuiltinDeclaration) {
+    has_custom_interface_descriptor =
+        static_cast<TorqueBuiltinDeclaration*>(decl)
+            ->has_custom_interface_descriptor;
+  }
 
   if (varargs && !javascript) {
     Error("Rest parameters require ", decl->name,
@@ -92,10 +98,23 @@ Builtin* DeclarationVisitor::CreateBuiltin(BuiltinDeclaration* decl,
   }
 
   for (size_t i = 0; i < signature.types().size(); ++i) {
-    if (signature.types()[i]->StructSupertype()) {
+    const Type* parameter_type = signature.types()[i];
+    if (parameter_type->StructSupertype()) {
       Error("Builtin do not support structs as arguments, but argument ",
             signature.parameter_names[i], " has type ", *signature.types()[i],
             ".");
+    }
+    if (parameter_type->IsFloat32() || parameter_type->IsFloat64()) {
+      if (!has_custom_interface_descriptor) {
+        Error("Builtin ", external_name,
+              " needs a custom interface descriptor, "
+              "because it uses type ",
+              *parameter_type, " for argument ", signature.parameter_names[i],
+              ". One reason being "
+              "that the default descriptor defines xmm0 to be the first "
+              "floating point argument register, which is current used as "
+              "scratch on ia32 and cannot be allocated.");
+      }
     }
   }
 
@@ -110,9 +129,12 @@ Builtin* DeclarationVisitor::CreateBuiltin(BuiltinDeclaration* decl,
     Error("Builtins cannot have return type void.");
   }
 
-  Builtin* builtin = Declarations::CreateBuiltin(std::move(external_name),
-                                                 std::move(readable_name), kind,
-                                                 std::move(signature), body);
+  Builtin::Flags flags = Builtin::Flag::kNone;
+  if (has_custom_interface_descriptor)
+    flags |= Builtin::Flag::kCustomInterfaceDescriptor;
+  Builtin* builtin = Declarations::CreateBuiltin(
+      std::move(external_name), std::move(readable_name), kind, flags,
+      std::move(signature), body);
   // TODO(v8:12261): Recheck this.
   // builtin->SetIdentifierPosition(decl->name->pos);
   return builtin;
@@ -121,14 +143,14 @@ Builtin* DeclarationVisitor::CreateBuiltin(BuiltinDeclaration* decl,
 void DeclarationVisitor::Visit(ExternalBuiltinDeclaration* decl) {
   Builtin* builtin =
       CreateBuiltin(decl, decl->name->value, decl->name->value,
-                    TypeVisitor::MakeSignature(decl), base::nullopt);
+                    TypeVisitor::MakeSignature(decl), std::nullopt);
   builtin->SetIdentifierPosition(decl->name->pos);
   Declarations::Declare(decl->name->value, builtin);
 }
 
 void DeclarationVisitor::Visit(ExternalRuntimeDeclaration* decl) {
   Signature signature = TypeVisitor::MakeSignature(decl);
-  if (signature.parameter_types.types.size() == 0) {
+  if (signature.parameter_types.types.empty()) {
     ReportError(
         "Missing parameters for runtime function, at least the context "
         "parameter is required.");
@@ -169,7 +191,7 @@ void DeclarationVisitor::Visit(ExternalRuntimeDeclaration* decl) {
 void DeclarationVisitor::Visit(ExternalMacroDeclaration* decl) {
   Macro* macro = Declarations::DeclareMacro(
       decl->name->value, true, decl->external_assembler_name,
-      TypeVisitor::MakeSignature(decl), base::nullopt, decl->op);
+      TypeVisitor::MakeSignature(decl), std::nullopt, decl->op);
   macro->SetIdentifierPosition(decl->name->pos);
   macro->SetPosition(decl->pos);
   if (GlobalContext::collect_kythe_data()) {
@@ -187,7 +209,7 @@ void DeclarationVisitor::Visit(TorqueBuiltinDeclaration* decl) {
 
 void DeclarationVisitor::Visit(TorqueMacroDeclaration* decl) {
   Macro* macro = Declarations::DeclareMacro(
-      decl->name->value, decl->export_to_csa, base::nullopt,
+      decl->name->value, decl->export_to_csa, std::nullopt,
       TypeVisitor::MakeSignature(decl), decl->body, decl->op);
   macro->SetIdentifierPosition(decl->name->pos);
   macro->SetPosition(decl->pos);
@@ -242,7 +264,7 @@ void DeclarationVisitor::Visit(SpecializationDeclaration* decl) {
 
   if (matching_generic == nullptr) {
     std::stringstream stream;
-    if (generic_list.size() == 0) {
+    if (generic_list.empty()) {
       stream << "no generic defined with the name " << decl->name;
       ReportError(stream.str());
     }
@@ -326,7 +348,7 @@ Signature DeclarationVisitor::MakeSpecializedSignature(
 
 Callable* DeclarationVisitor::SpecializeImplicit(
     const SpecializationKey<GenericCallable>& key) {
-  base::Optional<Statement*> body = key.generic->CallableBody();
+  std::optional<Statement*> body = key.generic->CallableBody();
   if (!body && IntrinsicDeclaration::DynamicCast(key.generic->declaration()) ==
                    nullptr) {
     ReportError("missing specialization of ", key.generic->name(),
@@ -336,7 +358,7 @@ Callable* DeclarationVisitor::SpecializeImplicit(
   SpecializationRequester requester{CurrentSourcePosition::Get(),
                                     CurrentScope::Get(), ""};
   CurrentScope::Scope generic_scope(key.generic->ParentScope());
-  Callable* result = Specialize(key, key.generic->declaration(), base::nullopt,
+  Callable* result = Specialize(key, key.generic->declaration(), std::nullopt,
                                 body, CurrentSourcePosition::Get());
   result->SetIsUserDefined(false);
   requester.name = result->ReadableName();
@@ -349,8 +371,8 @@ Callable* DeclarationVisitor::SpecializeImplicit(
 Callable* DeclarationVisitor::Specialize(
     const SpecializationKey<GenericCallable>& key,
     CallableDeclaration* declaration,
-    base::Optional<const SpecializationDeclaration*> explicit_specialization,
-    base::Optional<Statement*> body, SourcePosition position) {
+    std::optional<const SpecializationDeclaration*> explicit_specialization,
+    std::optional<Statement*> body, SourcePosition position) {
   CurrentSourcePosition::Scope pos_scope(position);
   size_t generic_parameter_count = key.generic->generic_parameters().size();
   if (generic_parameter_count != key.specialized_types.size()) {
@@ -413,6 +435,4 @@ void PredeclarationVisitor::ResolvePredeclarations() {
   }
 }
 
-}  // namespace torque
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::torque

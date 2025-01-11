@@ -8,7 +8,13 @@ const {
   kOrigin,
   kGetNetConnect
 } = require('./mock-symbols')
-const { buildURL, nop } = require('../core/util')
+const { serializePathWithQuery } = require('../core/util')
+const { STATUS_CODES } = require('node:http')
+const {
+  types: {
+    isPromise
+  }
+} = require('node:util')
 
 function matchValue (match, value) {
   if (typeof match === 'string') {
@@ -38,7 +44,7 @@ function lowerCaseEntries (headers) {
 function getHeaderByName (headers, key) {
   if (Array.isArray(headers)) {
     for (let i = 0; i < headers.length; i += 2) {
-      if (headers[i] === key) {
+      if (headers[i].toLocaleLowerCase() === key.toLocaleLowerCase()) {
         return headers[i + 1]
       }
     }
@@ -47,19 +53,24 @@ function getHeaderByName (headers, key) {
   } else if (typeof headers.get === 'function') {
     return headers.get(key)
   } else {
-    return headers[key]
+    return lowerCaseEntries(headers)[key.toLocaleLowerCase()]
   }
+}
+
+/** @param {string[]} headers */
+function buildHeadersFromArray (headers) { // fetch HeadersList
+  const clone = headers.slice()
+  const entries = []
+  for (let index = 0; index < clone.length; index += 2) {
+    entries.push([clone[index], clone[index + 1]])
+  }
+  return Object.fromEntries(entries)
 }
 
 function matchHeaders (mockDispatch, headers) {
   if (typeof mockDispatch.headers === 'function') {
     if (Array.isArray(headers)) { // fetch HeadersList
-      const clone = headers.slice()
-      const entries = []
-      for (let index = 0; index < clone.length; index += 2) {
-        entries.push([clone[index], clone[index + 1]])
-      }
-      headers = Object.fromEntries(entries)
+      headers = buildHeadersFromArray(headers)
     }
     return mockDispatch.headers(headers ? lowerCaseEntries(headers) : {})
   }
@@ -80,6 +91,22 @@ function matchHeaders (mockDispatch, headers) {
   return true
 }
 
+function safeUrl (path) {
+  if (typeof path !== 'string') {
+    return path
+  }
+
+  const pathSegments = path.split('?')
+
+  if (pathSegments.length !== 2) {
+    return path
+  }
+
+  const qp = new URLSearchParams(pathSegments.pop())
+  qp.sort()
+  return [...pathSegments, qp.toString()].join('?')
+}
+
 function matchKey (mockDispatch, { path, method, body, headers }) {
   const pathMatch = matchValue(mockDispatch.path, path)
   const methodMatch = matchValue(mockDispatch.method, method)
@@ -91,6 +118,10 @@ function matchKey (mockDispatch, { path, method, body, headers }) {
 function getResponseData (data) {
   if (Buffer.isBuffer(data)) {
     return data
+  } else if (data instanceof Uint8Array) {
+    return data
+  } else if (data instanceof ArrayBuffer) {
+    return data
   } else if (typeof data === 'object') {
     return JSON.stringify(data)
   } else {
@@ -99,10 +130,19 @@ function getResponseData (data) {
 }
 
 function getMockDispatch (mockDispatches, key) {
-  const resolvedPath = key.query ? buildURL(key.path, key.query) : key.path
+  const basePath = key.query ? serializePathWithQuery(key.path, key.query) : key.path
+  const resolvedPath = typeof basePath === 'string' ? safeUrl(basePath) : basePath
+
+  const resolvedPathWithoutTrailingSlash = removeTrailingSlash(resolvedPath)
 
   // Match path
-  let matchedMockDispatches = mockDispatches.filter(({ consumed }) => !consumed).filter(({ path }) => matchValue(path, resolvedPath))
+  let matchedMockDispatches = mockDispatches
+    .filter(({ consumed }) => !consumed)
+    .filter(({ path, ignoreTrailingSlash }) => {
+      return ignoreTrailingSlash
+        ? matchValue(removeTrailingSlash(safeUrl(path)), resolvedPathWithoutTrailingSlash)
+        : matchValue(safeUrl(path), resolvedPath)
+    })
   if (matchedMockDispatches.length === 0) {
     throw new MockNotMatchedError(`Mock dispatch not matched for path '${resolvedPath}'`)
   }
@@ -110,26 +150,27 @@ function getMockDispatch (mockDispatches, key) {
   // Match method
   matchedMockDispatches = matchedMockDispatches.filter(({ method }) => matchValue(method, key.method))
   if (matchedMockDispatches.length === 0) {
-    throw new MockNotMatchedError(`Mock dispatch not matched for method '${key.method}'`)
+    throw new MockNotMatchedError(`Mock dispatch not matched for method '${key.method}' on path '${resolvedPath}'`)
   }
 
   // Match body
   matchedMockDispatches = matchedMockDispatches.filter(({ body }) => typeof body !== 'undefined' ? matchValue(body, key.body) : true)
   if (matchedMockDispatches.length === 0) {
-    throw new MockNotMatchedError(`Mock dispatch not matched for body '${key.body}'`)
+    throw new MockNotMatchedError(`Mock dispatch not matched for body '${key.body}' on path '${resolvedPath}'`)
   }
 
   // Match headers
   matchedMockDispatches = matchedMockDispatches.filter((mockDispatch) => matchHeaders(mockDispatch, key.headers))
   if (matchedMockDispatches.length === 0) {
-    throw new MockNotMatchedError(`Mock dispatch not matched for headers '${typeof key.headers === 'object' ? JSON.stringify(key.headers) : key.headers}'`)
+    const headers = typeof key.headers === 'object' ? JSON.stringify(key.headers) : key.headers
+    throw new MockNotMatchedError(`Mock dispatch not matched for headers '${headers}' on path '${resolvedPath}'`)
   }
 
   return matchedMockDispatches[0]
 }
 
-function addMockDispatch (mockDispatches, key, data) {
-  const baseData = { timesInvoked: 0, times: 1, persist: false, consumed: false }
+function addMockDispatch (mockDispatches, key, data, opts) {
+  const baseData = { timesInvoked: 0, times: 1, persist: false, consumed: false, ...opts }
   const replyData = typeof data === 'function' ? { callback: data } : { ...data }
   const newMockDispatch = { ...baseData, ...key, pending: true, data: { error: null, ...replyData } }
   mockDispatches.push(newMockDispatch)
@@ -148,8 +189,24 @@ function deleteMockDispatch (mockDispatches, key) {
   }
 }
 
+/**
+ * @param {string} path Path to remove trailing slash from
+ */
+function removeTrailingSlash (path) {
+  while (path.endsWith('/')) {
+    path = path.slice(0, -1)
+  }
+
+  if (path.length === 0) {
+    path = '/'
+  }
+
+  return path
+}
+
 function buildKey (opts) {
   const { path, method, body, headers, query } = opts
+
   return {
     path,
     method,
@@ -160,7 +217,21 @@ function buildKey (opts) {
 }
 
 function generateKeyValues (data) {
-  return Object.entries(data).reduce((keyValuePairs, [key, value]) => [...keyValuePairs, key, value], [])
+  const keys = Object.keys(data)
+  const result = []
+  for (let i = 0; i < keys.length; ++i) {
+    const key = keys[i]
+    const value = data[key]
+    const name = Buffer.from(`${key}`)
+    if (Array.isArray(value)) {
+      for (let j = 0; j < value.length; ++j) {
+        result.push(name, Buffer.from(`${value[j]}`))
+      }
+    } else {
+      result.push(name, Buffer.from(`${value}`))
+    }
+  }
+  return result
 }
 
 /**
@@ -168,72 +239,7 @@ function generateKeyValues (data) {
  * @param {number} statusCode
  */
 function getStatusText (statusCode) {
-  switch (statusCode) {
-    case 100: return 'Continue'
-    case 101: return 'Switching Protocols'
-    case 102: return 'Processing'
-    case 103: return 'Early Hints'
-    case 200: return 'OK'
-    case 201: return 'Created'
-    case 202: return 'Accepted'
-    case 203: return 'Non-Authoritative Information'
-    case 204: return 'No Content'
-    case 205: return 'Reset Content'
-    case 206: return 'Partial Content'
-    case 207: return 'Multi-Status'
-    case 208: return 'Already Reported'
-    case 226: return 'IM Used'
-    case 300: return 'Multiple Choice'
-    case 301: return 'Moved Permanently'
-    case 302: return 'Found'
-    case 303: return 'See Other'
-    case 304: return 'Not Modified'
-    case 305: return 'Use Proxy'
-    case 306: return 'unused'
-    case 307: return 'Temporary Redirect'
-    case 308: return 'Permanent Redirect'
-    case 400: return 'Bad Request'
-    case 401: return 'Unauthorized'
-    case 402: return 'Payment Required'
-    case 403: return 'Forbidden'
-    case 404: return 'Not Found'
-    case 405: return 'Method Not Allowed'
-    case 406: return 'Not Acceptable'
-    case 407: return 'Proxy Authentication Required'
-    case 408: return 'Request Timeout'
-    case 409: return 'Conflict'
-    case 410: return 'Gone'
-    case 411: return 'Length Required'
-    case 412: return 'Precondition Failed'
-    case 413: return 'Payload Too Large'
-    case 414: return 'URI Too Large'
-    case 415: return 'Unsupported Media Type'
-    case 416: return 'Range Not Satisfiable'
-    case 417: return 'Expectation Failed'
-    case 418: return 'I\'m a teapot'
-    case 421: return 'Misdirected Request'
-    case 422: return 'Unprocessable Entity'
-    case 423: return 'Locked'
-    case 424: return 'Failed Dependency'
-    case 425: return 'Too Early'
-    case 426: return 'Upgrade Required'
-    case 428: return 'Precondition Required'
-    case 429: return 'Too Many Requests'
-    case 431: return 'Request Header Fields Too Large'
-    case 451: return 'Unavailable For Legal Reasons'
-    case 500: return 'Internal Server Error'
-    case 501: return 'Not Implemented'
-    case 502: return 'Bad Gateway'
-    case 503: return 'Service Unavailable'
-    case 504: return 'Gateway Timeout'
-    case 505: return 'HTTP Version Not Supported'
-    case 506: return 'Variant Also Negotiates'
-    case 507: return 'Insufficient Storage'
-    case 508: return 'Loop Detected'
-    case 510: return 'Not Extended'
-    case 511: return 'Network Authentication Required'
-    default: return 'unknown'
-  }
+  return STATUS_CODES[statusCode] || 'unknown'
 }
 
 async function getResponse (body) {
@@ -283,15 +289,34 @@ function mockDispatch (opts, handler) {
     handleReply(this[kDispatches])
   }
 
-  function handleReply (mockDispatches) {
-    const responseData = getResponseData(typeof data === 'function' ? data(opts) : data)
+  function handleReply (mockDispatches, _data = data) {
+    // fetch's HeadersList is a 1D string array
+    const optsHeaders = Array.isArray(opts.headers)
+      ? buildHeadersFromArray(opts.headers)
+      : opts.headers
+    const body = typeof _data === 'function'
+      ? _data({ ...opts, headers: optsHeaders })
+      : _data
+
+    // util.types.isPromise is likely needed for jest.
+    if (isPromise(body)) {
+      // If handleReply is asynchronous, throwing an error
+      // in the callback will reject the promise, rather than
+      // synchronously throw the error, which breaks some tests.
+      // Rather, we wait for the callback to resolve if it is a
+      // promise, and then re-run handleReply with the new body.
+      body.then((newData) => handleReply(mockDispatches, newData))
+      return
+    }
+
+    const responseData = getResponseData(body)
     const responseHeaders = generateKeyValues(headers)
     const responseTrailers = generateKeyValues(trailers)
 
-    handler.abort = nop
-    handler.onHeaders(statusCode, responseHeaders, resume, getStatusText(statusCode))
-    handler.onData(Buffer.from(responseData))
-    handler.onComplete(responseTrailers)
+    handler.onConnect?.(err => handler.onError(err), null)
+    handler.onHeaders?.(statusCode, responseHeaders, resume, getStatusText(statusCode))
+    handler.onData?.(Buffer.from(responseData))
+    handler.onComplete?.(responseTrailers)
     deleteMockDispatch(mockDispatches, key)
   }
 
@@ -361,5 +386,6 @@ module.exports = {
   buildMockDispatch,
   checkNetConnect,
   buildMockOptions,
-  getHeaderByName
+  getHeaderByName,
+  buildHeadersFromArray
 }

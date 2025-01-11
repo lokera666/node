@@ -272,8 +272,8 @@ for (let i = 0, l = rfc4231.length; i < l; i++) {
                        .update(rfc4231[i].data)
                        .digest('hex');
     if (rfc4231[i].truncate) {
-      actual = actual.substr(0, 32); // first 128 bits == 32 hex chars
-      strRes = strRes.substr(0, 32);
+      actual = actual.slice(0, 32); // first 128 bits == 32 hex chars
+      strRes = strRes.slice(0, 32);
     }
     const expected = rfc4231[i].hmac[hash];
     assert.strictEqual(
@@ -449,4 +449,23 @@ assert.strictEqual(
   assert.throws(
     () => crypto.createHmac('sha7', 'key'),
     /Invalid digest/);
+}
+
+{
+  const buf = Buffer.alloc(0);
+  const keyObject = crypto.createSecretKey(Buffer.alloc(0));
+  assert.deepStrictEqual(
+    crypto.createHmac('sha256', buf).update('foo').digest(),
+    crypto.createHmac('sha256', keyObject).update('foo').digest(),
+  );
+}
+
+{
+  crypto.Hmac('sha256', 'Node');
+  common.expectWarning({
+    DeprecationWarning: [
+      ['crypto.Hmac constructor is deprecated.',
+       'DEP0181'],
+    ]
+  });
 }

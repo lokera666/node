@@ -1,12 +1,10 @@
 'use strict';
 // Flags: --expose-gc
-// just like test-gc-http-client.js,
-// but with a timeout set
+// Like test-gc-http-client.js, but with a timeout set.
 
 const common = require('../common');
-const onGC = require('../common/ongc');
+const { onGC } = require('../common/gc');
 const http = require('http');
-const os = require('os');
 
 function serverHandler(req, res) {
   setTimeout(function() {
@@ -16,17 +14,17 @@ function serverHandler(req, res) {
   }, 100);
 }
 
-const cpus = os.cpus().length;
-let createClients = true;
+const numRequests = 128;
 let done = 0;
-let count = 0;
 let countGC = 0;
 
 const server = http.createServer(serverHandler);
-server.listen(0, common.mustCall(getAll));
+server.listen(0, common.mustCall(() => {
+  getAll(numRequests);
+}));
 
-function getAll() {
-  if (!createClients)
+function getAll(requestsRemaining) {
+  if (requestsRemaining <= 0)
     return;
 
   const req = http.get({
@@ -37,14 +35,10 @@ function getAll() {
 
   req.setTimeout(10, common.mustCall());
 
-  count++;
   onGC(req, { ongc });
 
-  setImmediate(getAll);
+  setImmediate(getAll, requestsRemaining - 1);
 }
-
-for (let i = 0; i < cpus; i++)
-  getAll();
 
 function cb(res) {
   res.resume();
@@ -59,10 +53,9 @@ setImmediate(status);
 
 function status() {
   if (done > 0) {
-    createClients = false;
     global.gc();
-    console.log(`done/collected/total: ${done}/${countGC}/${count}`);
-    if (countGC === count) {
+    console.log(`done/collected/total: ${done}/${countGC}/${numRequests}`);
+    if (countGC === numRequests) {
       server.close();
       return;
     }

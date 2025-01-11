@@ -39,18 +39,25 @@ const cp = require('child_process');
 
 const tmpdir = require('../common/tmpdir');
 
-const filename = require('path').join(tmpdir.path, 'big');
+const filename = tmpdir.resolve('big');
 let server;
 
 function executeRequest(cb) {
-  cp.exec([`"${process.execPath}"`,
-           `"${__filename}"`,
+  // The execPath might contain chars that should be escaped in a shell context.
+  // On non-Windows, we can pass the path via the env; `"` is not a valid char on
+  // Windows, so we can simply pass the path.
+  const node = `"${common.isWindows ? process.execPath : '$NODE'}"`;
+  const file = `"${common.isWindows ? __filename : '$FILE'}"`;
+  const env = common.isWindows ? process.env : { ...process.env, NODE: process.execPath, FILE: __filename };
+  cp.exec([node,
+           file,
            'request',
            server.address().port,
            '|',
-           `"${process.execPath}"`,
-           `"${__filename}"`,
+           node,
+           file,
            'shasum' ].join(' '),
+          { env },
           (err, stdout, stderr) => {
             if (stderr.trim() !== '') {
               console.log(stderr);

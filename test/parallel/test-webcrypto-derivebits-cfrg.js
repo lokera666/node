@@ -6,8 +6,7 @@ if (!common.hasCrypto)
   common.skip('missing crypto');
 
 const assert = require('assert');
-const { webcrypto } = require('crypto');
-const { subtle } = webcrypto;
+const { subtle } = globalThis.crypto;
 
 const kTests = [
   {
@@ -52,7 +51,7 @@ async function prepareKeys() {
           Buffer.from(spki, 'hex'),
           { name },
           true,
-          ['deriveKey', 'deriveBits']),
+          []),
       ]);
       keys[name] = {
         privateKey,
@@ -103,6 +102,16 @@ async function prepareKeys() {
       }
 
       {
+        // Default length
+        const bits = await subtle.deriveBits({
+          name,
+          public: publicKey
+        }, privateKey);
+
+        assert.strictEqual(Buffer.from(bits).toString('hex'), result);
+      }
+
+      {
         // Short Result
         const bits = await subtle.deriveBits({
           name,
@@ -131,9 +140,11 @@ async function prepareKeys() {
           public: publicKey
         }, privateKey, 8 * size - 11);
 
-        assert.strictEqual(
-          Buffer.from(bits).toString('hex'),
-          result.slice(0, -2));
+        const expected = Buffer.from(result.slice(0, -2), 'hex');
+        expected[size - 2] = expected[size - 2] & 0b11111000;
+        assert.deepStrictEqual(
+          Buffer.from(bits),
+          expected);
       }
     }));
 
@@ -145,7 +156,7 @@ async function prepareKeys() {
         { name: 'X448' },
         keys.X448.privateKey,
         8 * keys.X448.size),
-      { code: 'ERR_INVALID_ARG_TYPE' });
+      { code: 'ERR_MISSING_OPTION' });
   }
 
   {
@@ -180,7 +191,7 @@ async function prepareKeys() {
       name: 'X448',
       public: keys.X448.publicKey
     }, keys.X448.publicKey, null), {
-      message: /baseKey must be a private key/
+      name: 'InvalidAccessError'
     });
   }
 
@@ -190,13 +201,13 @@ async function prepareKeys() {
       name: 'X448',
       public: keys.X448.privateKey
     }, keys.X448.publicKey, null), {
-      message: /algorithm\.public must be a public key/
+      name: 'InvalidAccessError'
     });
   }
 
   {
     // Public is a secret key
-    const keyData = webcrypto.getRandomValues(new Uint8Array(32));
+    const keyData = globalThis.crypto.getRandomValues(new Uint8Array(32));
     const key = await subtle.importKey(
       'raw',
       keyData,
@@ -207,7 +218,7 @@ async function prepareKeys() {
       name: 'X448',
       public: key
     }, keys.X448.publicKey, null), {
-      message: /algorithm\.public must be a public key/
+      name: 'InvalidAccessError'
     });
   }
 })().then(common.mustCall());
