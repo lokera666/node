@@ -5,12 +5,11 @@
 #ifndef V8_COMPILER_SCHEDULER_H_
 #define V8_COMPILER_SCHEDULER_H_
 
+#include <optional>
+
 #include "src/base/flags.h"
-#include "src/common/globals.h"
 #include "src/compiler/node.h"
-#include "src/compiler/opcodes.h"
 #include "src/compiler/schedule.h"
-#include "src/compiler/zone-stats.h"
 #include "src/zone/zone-containers.h"
 
 namespace v8 {
@@ -108,7 +107,7 @@ class V8_EXPORT_PRIVATE Scheduler {
   bool IsLive(Node* node);
 
   // If the node is coupled, returns the coupled control edge index.
-  inline base::Optional<int> GetCoupledControlEdge(Node* node);
+  inline std::optional<int> GetCoupledControlEdge(Node* node);
   void IncrementUnscheduledUseCount(Node* node, Node* from);
   void DecrementUnscheduledUseCount(Node* node, Node* from);
 

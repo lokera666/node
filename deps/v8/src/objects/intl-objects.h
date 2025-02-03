@@ -2,15 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_INTL_SUPPORT
-#error Internationalization is expected to be enabled.
-#endif  // V8_INTL_SUPPORT
-
 #ifndef V8_OBJECTS_INTL_OBJECTS_H_
 #define V8_OBJECTS_INTL_OBJECTS_H_
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -21,19 +18,45 @@
 #include "unicode/locid.h"
 #include "unicode/uversion.h"
 
-#define V8_MINIMUM_ICU_VERSION 69
+#ifndef V8_INTL_SUPPORT
+#error Internationalization is expected to be enabled.
+#endif  // V8_INTL_SUPPORT
+
+#define V8_MINIMUM_ICU_VERSION 73
 
 namespace U_ICU_NAMESPACE {
 class BreakIterator;
+class Locale;
+class ListFormatter;
+class RelativeDateTimeFormatter;
+class SimpleDateFormat;
+class DateIntervalFormat;
+class PluralRules;
 class Collator;
 class FormattedValue;
 class StringEnumeration;
 class TimeZone;
 class UnicodeString;
+namespace number {
+class LocalizedNumberFormatter;
+}  //  namespace number
 }  // namespace U_ICU_NAMESPACE
 
-namespace v8 {
-namespace internal {
+namespace v8::internal {
+
+#define ICU_EXTERNAL_POINTER_TAG_LIST(V)                              \
+  V(icu::UnicodeString, kIcuUnicodeStringTag)                         \
+  V(icu::BreakIterator, kIcuBreakIteratorTag)                         \
+  V(icu::Locale, kIcuLocaleTag)                                       \
+  V(icu::SimpleDateFormat, kIcuSimpleDateFormatTag)                   \
+  V(icu::DateIntervalFormat, kIcuDateIntervalFormatTag)               \
+  V(icu::RelativeDateTimeFormatter, kIcuRelativeDateTimeFormatterTag) \
+  V(icu::ListFormatter, kIcuListFormatterTag)                         \
+  V(icu::Collator, kIcuCollatorTag)                                   \
+  V(icu::PluralRules, kIcuPluralRulesTag)                             \
+  V(icu::number::LocalizedNumberFormatter, kIcuLocalizedNumberFormatterTag)
+ICU_EXTERNAL_POINTER_TAG_LIST(ASSIGN_EXTERNAL_POINTER_TAG_FOR_MANAGED)
+#undef ICU_EXTERNAL_POINTER_TAG_LIST
 
 struct NumberFormatSpan {
   int32_t field_id;
@@ -48,8 +71,6 @@ struct NumberFormatSpan {
 V8_EXPORT_PRIVATE std::vector<NumberFormatSpan> FlattenRegionsToParts(
     std::vector<NumberFormatSpan>* regions);
 
-template <typename T>
-class Handle;
 class JSCollator;
 
 class Intl {
@@ -124,7 +145,7 @@ class Intl {
   V8_WARN_UNUSED_RESULT static MaybeHandle<String> ConvertToLower(
       Isolate* isolate, Handle<String> s);
 
-  V8_WARN_UNUSED_RESULT static base::Optional<int> StringLocaleCompare(
+  V8_WARN_UNUSED_RESULT static std::optional<int> StringLocaleCompare(
       Isolate* isolate, Handle<String> s1, Handle<String> s2,
       Handle<Object> locales, Handle<Object> options, const char* method_name);
 
@@ -134,7 +155,8 @@ class Intl {
   };
   template <class IsolateT>
   V8_EXPORT_PRIVATE static CompareStringsOptions CompareStringsOptionsFor(
-      IsolateT* isolate, Handle<Object> locales, Handle<Object> options);
+      IsolateT* isolate, DirectHandle<Object> locales,
+      DirectHandle<Object> options);
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static int CompareStrings(
       Isolate* isolate, const icu::Collator& collator, Handle<String> s1,
       Handle<String> s2,
@@ -161,6 +183,29 @@ class Intl {
     kLessPrecision,
   };
 
+  // [[RoundingMode]] is one of the String values "ceil", "floor", "expand",
+  // "trunc", "halfCeil", "halfFloor", "halfExpand", "halfTrunc", or "halfEven",
+  // specifying the rounding strategy for the number.
+  enum class RoundingMode {
+    kCeil,
+    kFloor,
+    kExpand,
+    kTrunc,
+    kHalfCeil,
+    kHalfFloor,
+    kHalfExpand,
+    kHalfTrunc,
+    kHalfEven,
+  };
+
+  // [[TrailingZeroDisplay]] is one of the String values "auto" or
+  // "stripIfInteger", specifying the strategy for displaying trailing zeros on
+  // whole number.
+  enum class TrailingZeroDisplay {
+    kAuto,
+    kStripIfInteger,
+  };
+
   // ecma402/#sec-setnfdigitoptions
   struct NumberFormatDigitOptions {
     int minimum_integer_digits;
@@ -170,11 +215,14 @@ class Intl {
     int maximum_significant_digits;
     RoundingPriority rounding_priority;
     RoundingType rounding_type;
+    int rounding_increment;
+    RoundingMode rounding_mode;
+    TrailingZeroDisplay trailing_zero_display;
   };
   V8_WARN_UNUSED_RESULT static Maybe<NumberFormatDigitOptions>
   SetNumberFormatDigitOptions(Isolate* isolate, Handle<JSReceiver> options,
                               int mnfd_default, int mxfd_default,
-                              bool notation_is_compact);
+                              bool notation_is_compact, const char* service);
 
   // Helper function to convert a UnicodeString to a Handle<String>
   V8_WARN_UNUSED_RESULT static MaybeHandle<String> ToString(
@@ -198,8 +246,8 @@ class Intl {
   // A helper function to implement formatToParts which add element to array as
   // $array[$index] = { type: $field_type_string, value: $value }
   static void AddElement(Isolate* isolate, Handle<JSArray> array, int index,
-                         Handle<String> field_type_string,
-                         Handle<String> value);
+                         DirectHandle<String> field_type_string,
+                         DirectHandle<String> value);
 
   // A helper function to implement formatToParts which add element to array as
   // $array[$index] = {
@@ -207,9 +255,16 @@ class Intl {
   //   $additional_property_name: $additional_property_value
   // }
   static void AddElement(Isolate* isolate, Handle<JSArray> array, int index,
-                         Handle<String> field_type_string, Handle<String> value,
+                         DirectHandle<String> field_type_string,
+                         DirectHandle<String> value,
                          Handle<String> additional_property_name,
-                         Handle<String> additional_property_value);
+                         DirectHandle<String> additional_property_value);
+
+  // A helper function to implement formatToParts which add element to array
+  static Maybe<int> AddNumberElements(Isolate* isolate,
+                                      const icu::FormattedValue& formatted,
+                                      Handle<JSArray> result, int start_index,
+                                      DirectHandle<String> unit);
 
   // In ECMA 402 v1, Intl constructors supported a mode of operation
   // where calling them with an existing object as a receiver would
@@ -319,7 +374,7 @@ class Intl {
 
   // Convert a Handle<String> to icu::UnicodeString
   static icu::UnicodeString ToICUUnicodeString(Isolate* isolate,
-                                               Handle<String> string,
+                                               DirectHandle<String> string,
                                                int offset = 0);
 
   static const uint8_t* ToLatin1LowerTable();
@@ -328,7 +383,8 @@ class Intl {
   static const uint8_t* AsciiCollationWeightsL3();
   static const int kAsciiCollationWeightsLength;
 
-  static String ConvertOneByteToLower(String src, String dst);
+  static Tagged<String> ConvertOneByteToLower(Tagged<String> src,
+                                              Tagged<String> dst);
 
   static const std::set<std::string>& GetAvailableLocales();
 
@@ -350,30 +406,60 @@ class Intl {
       const icu::TimeZone& tz);
   V8_WARN_UNUSED_RESULT static bool IsValidTimeZoneName(Isolate* isolate,
                                                         const std::string& id);
-  V8_WARN_UNUSED_RESULT static bool IsValidTimeZoneName(Isolate* isolate,
-                                                        Handle<String> id);
+  V8_WARN_UNUSED_RESULT static bool IsValidTimeZoneName(
+      Isolate* isolate, DirectHandle<String> id);
 
   // Function to support Temporal
   V8_WARN_UNUSED_RESULT static std::string TimeZoneIdFromIndex(int32_t index);
 
-  V8_WARN_UNUSED_RESULT static Maybe<bool> GetTimeZoneIndex(
-      Isolate* isolate, Handle<String> identifier, int32_t* index);
+  // Return the index of timezone which later could be used with
+  // TimeZoneIdFromIndex. Returns -1 while the identifier is not a built-in
+  // TimeZone name.
+  static int32_t GetTimeZoneIndex(Isolate* isolate,
+                                  DirectHandle<String> identifier);
+
+  enum class Transition { kNext, kPrevious };
+
+  // Functions to support Temporal
+
+  // Return the epoch of transition in BigInt or null if there are no
+  // transition.
+  static Handle<Object> GetTimeZoneOffsetTransitionNanoseconds(
+      Isolate* isolate, int32_t time_zone_index,
+      Handle<BigInt> nanosecond_epoch, Transition transition);
+
+  // Return the Time Zone offset, in the unit of nanosecond by int64_t, during
+  // the time of the nanosecond_epoch.
+  static int64_t GetTimeZoneOffsetNanoseconds(Isolate* isolate,
+                                              int32_t time_zone_index,
+                                              Handle<BigInt> nanosecond_epoch);
+
+  // This function may return the result, the std::vector<int64_t> in one of
+  // the following three condictions:
+  // 1. While nanosecond_epoch fall into the daylight saving time change
+  // moment that skipped one (or two or even six, in some Time Zone) hours
+  // later in local time:
+  //    [],
+  // 2. In other moment not during daylight saving time change:
+  //    [offset_former], and
+  // 3. when nanosecond_epoch fall into they daylight saving time change hour
+  // which the clock time roll back one (or two or six, in some Time Zone) hour:
+  //    [offset_former, offset_later]
+  // The unit of the return values in BigInt is nanosecond.
+  static std::vector<Handle<BigInt>> GetTimeZonePossibleOffsetNanoseconds(
+      Isolate* isolate, int32_t time_zone_index,
+      Handle<BigInt> nanosecond_epoch);
+
+  static Handle<String> DefaultTimeZone(Isolate* isolate);
 
   V8_WARN_UNUSED_RESULT static MaybeHandle<String> CanonicalizeTimeZoneName(
-      Isolate* isolate, Handle<String> identifier);
+      Isolate* isolate, DirectHandle<String> identifier);
 
   // ecma402/#sec-coerceoptionstoobject
   V8_WARN_UNUSED_RESULT static MaybeHandle<JSReceiver> CoerceOptionsToObject(
       Isolate* isolate, Handle<Object> options, const char* service);
-
-  // #sec-tointlmathematicalvalue
-  // The implementation preserve the Object in String, BigInt or Number
-  V8_WARN_UNUSED_RESULT static MaybeHandle<Object>
-  ToIntlMathematicalValueAsNumberBigIntOrString(Isolate* isolate,
-                                                Handle<Object> input);
 };
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal
 
 #endif  // V8_OBJECTS_INTL_OBJECTS_H_

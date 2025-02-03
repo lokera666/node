@@ -28,7 +28,6 @@
 #endif  // __MINGW32__
 
 #ifdef __POSIX__
-# include <unistd.h>        // gethostname, sysconf
 # include <climits>         // PATH_MAX on Solaris.
 #endif  // __POSIX__
 
@@ -49,6 +48,7 @@ using v8::Int32;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::LocalVector;
 using v8::MaybeLocal;
 using v8::NewStringType;
 using v8::Null;
@@ -86,12 +86,12 @@ static void GetOSInformation(const FunctionCallbackInfo<Value>& args) {
     return args.GetReturnValue().SetUndefined();
   }
 
-  // [sysname, version, release]
+  // [sysname, version, release, machine]
   Local<Value> osInformation[] = {
-    String::NewFromUtf8(env->isolate(), info.sysname).ToLocalChecked(),
-    String::NewFromUtf8(env->isolate(), info.version).ToLocalChecked(),
-    String::NewFromUtf8(env->isolate(), info.release).ToLocalChecked()
-  };
+      String::NewFromUtf8(env->isolate(), info.sysname).ToLocalChecked(),
+      String::NewFromUtf8(env->isolate(), info.version).ToLocalChecked(),
+      String::NewFromUtf8(env->isolate(), info.release).ToLocalChecked(),
+      String::NewFromUtf8(env->isolate(), info.machine).ToLocalChecked()};
 
   args.GetReturnValue().Set(Array::New(env->isolate(),
                                        osInformation,
@@ -113,7 +113,7 @@ static void GetCPUInfo(const FunctionCallbackInfo<Value>& args) {
   // assemble them into objects in JS than to call Object::Set() repeatedly
   // The array is in the format
   // [model, speed, (5 entries of cpu_times), model2, speed2, ...]
-  std::vector<Local<Value>> result;
+  LocalVector<Value> result(isolate);
   result.reserve(count * 7);
   for (int i = 0; i < count; i++) {
     uv_cpu_info_t* ci = cpu_infos + i;
@@ -149,10 +149,15 @@ static void GetTotalMemory(const FunctionCallbackInfo<Value>& args) {
 
 
 static void GetUptime(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
   double uptime;
   int err = uv_uptime(&uptime);
-  if (err == 0)
-    args.GetReturnValue().Set(uptime);
+  if (err != 0) {
+    env->CollectUVExceptionInfo(args[args.Length() - 1], err, "uv_uptime");
+    return args.GetReturnValue().SetUndefined();
+  }
+
+  args.GetReturnValue().Set(uptime);
 }
 
 
@@ -161,7 +166,7 @@ static void GetLoadAvg(const FunctionCallbackInfo<Value>& args) {
   Local<Float64Array> array = args[0].As<Float64Array>();
   CHECK_EQ(array->Length(), 3);
   Local<ArrayBuffer> ab = array->Buffer();
-  double* loadavg = static_cast<double*>(ab->GetBackingStore()->Data());
+  double* loadavg = static_cast<double*>(ab->Data());
   uv_loadavg(loadavg);
 }
 
@@ -189,7 +194,7 @@ static void GetInterfaceAddresses(const FunctionCallbackInfo<Value>& args) {
   }
 
   Local<Value> no_scope_id = Integer::New(isolate, -1);
-  std::vector<Local<Value>> result;
+  LocalVector<Value> result(isolate);
   result.reserve(count * 7);
   for (i = 0; i < count; i++) {
     const char* const raw_name = interfaces[i].name;
@@ -230,7 +235,7 @@ static void GetInterfaceAddresses(const FunctionCallbackInfo<Value>& args) {
     result.emplace_back(family);
     result.emplace_back(FIXED_ONE_BYTE_STRING(isolate, mac));
     result.emplace_back(
-        interfaces[i].is_internal ? True(isolate) : False(isolate));
+        Boolean::New(env->isolate(), interfaces[i].is_internal));
     if (interfaces[i].address.address4.sin_family == AF_INET6) {
       uint32_t scopeid = interfaces[i].address.address6.sin6_scope_id;
       result.emplace_back(Integer::NewFromUnsigned(isolate, scopeid));
@@ -283,21 +288,29 @@ static void GetUserInfo(const FunctionCallbackInfo<Value>& args) {
     encoding = UTF8;
   }
 
-  const int err = uv_os_get_passwd(&pwd);
-
-  if (err) {
+  if (const int err = uv_os_get_passwd(&pwd)) {
     CHECK_GE(args.Length(), 2);
     env->CollectUVExceptionInfo(args[args.Length() - 1], err,
                                 "uv_os_get_passwd");
     return args.GetReturnValue().SetUndefined();
   }
 
-  auto free_passwd = OnScopeLeave([&]() { uv_os_free_passwd(&pwd); });
+  auto free_passwd = OnScopeLeave([&] { uv_os_free_passwd(&pwd); });
 
   Local<Value> error;
 
+#ifdef _WIN32
+  Local<Value> uid = Number::New(
+      env->isolate(),
+      static_cast<double>(static_cast<int32_t>(pwd.uid & 0xFFFFFFFF)));
+  Local<Value> gid = Number::New(
+      env->isolate(),
+      static_cast<double>(static_cast<int32_t>(pwd.gid & 0xFFFFFFFF)));
+#else
   Local<Value> uid = Number::New(env->isolate(), pwd.uid);
   Local<Value> gid = Number::New(env->isolate(), pwd.gid);
+#endif
+
   MaybeLocal<Value> username = StringBytes::Encode(env->isolate(),
                                                    pwd.username,
                                                    encoding,
@@ -319,21 +332,22 @@ static void GetUserInfo(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
-  Local<Object> entry = Object::New(env->isolate());
-
-  entry->Set(env->context(), env->uid_string(), uid).Check();
-  entry->Set(env->context(), env->gid_string(), gid).Check();
-  entry->Set(env->context(),
-             env->username_string(),
-             username.ToLocalChecked()).Check();
-  entry->Set(env->context(),
-             env->homedir_string(),
-             homedir.ToLocalChecked()).Check();
-  entry->Set(env->context(),
-             env->shell_string(),
-             shell.ToLocalChecked()).Check();
-
-  args.GetReturnValue().Set(entry);
+  constexpr size_t kRetLength = 5;
+  std::array<Local<v8::Name>, kRetLength> names = {env->uid_string(),
+                                                   env->gid_string(),
+                                                   env->username_string(),
+                                                   env->homedir_string(),
+                                                   env->shell_string()};
+  std::array values = {uid,
+                       gid,
+                       username.ToLocalChecked(),
+                       homedir.ToLocalChecked(),
+                       shell.ToLocalChecked()};
+  args.GetReturnValue().Set(Object::New(env->isolate(),
+                                        Null(env->isolate()),
+                                        names.data(),
+                                        values.data(),
+                                        kRetLength));
 }
 
 
@@ -376,27 +390,35 @@ static void GetPriority(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(priority);
 }
 
+static void GetAvailableParallelism(const FunctionCallbackInfo<Value>& args) {
+  unsigned int parallelism = uv_available_parallelism();
+  args.GetReturnValue().Set(parallelism);
+}
 
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
                 void* priv) {
   Environment* env = Environment::GetCurrent(context);
-  env->SetMethod(target, "getHostname", GetHostname);
-  env->SetMethod(target, "getLoadAvg", GetLoadAvg);
-  env->SetMethod(target, "getUptime", GetUptime);
-  env->SetMethod(target, "getTotalMem", GetTotalMemory);
-  env->SetMethod(target, "getFreeMem", GetFreeMemory);
-  env->SetMethod(target, "getCPUs", GetCPUInfo);
-  env->SetMethod(target, "getInterfaceAddresses", GetInterfaceAddresses);
-  env->SetMethod(target, "getHomeDirectory", GetHomeDirectory);
-  env->SetMethod(target, "getUserInfo", GetUserInfo);
-  env->SetMethod(target, "setPriority", SetPriority);
-  env->SetMethod(target, "getPriority", GetPriority);
-  env->SetMethod(target, "getOSInformation", GetOSInformation);
-  target->Set(env->context(),
-              FIXED_ONE_BYTE_STRING(env->isolate(), "isBigEndian"),
-              Boolean::New(env->isolate(), IsBigEndian())).Check();
+  SetMethod(context, target, "getHostname", GetHostname);
+  SetMethod(context, target, "getLoadAvg", GetLoadAvg);
+  SetMethod(context, target, "getUptime", GetUptime);
+  SetMethod(context, target, "getTotalMem", GetTotalMemory);
+  SetMethod(context, target, "getFreeMem", GetFreeMemory);
+  SetMethod(context, target, "getCPUs", GetCPUInfo);
+  SetMethod(context, target, "getInterfaceAddresses", GetInterfaceAddresses);
+  SetMethod(context, target, "getHomeDirectory", GetHomeDirectory);
+  SetMethod(context, target, "getUserInfo", GetUserInfo);
+  SetMethod(context, target, "setPriority", SetPriority);
+  SetMethod(context, target, "getPriority", GetPriority);
+  SetMethod(
+      context, target, "getAvailableParallelism", GetAvailableParallelism);
+  SetMethod(context, target, "getOSInformation", GetOSInformation);
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(env->isolate(), "isBigEndian"),
+            Boolean::New(env->isolate(), IsBigEndian()))
+      .Check();
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -411,11 +433,12 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(GetUserInfo);
   registry->Register(SetPriority);
   registry->Register(GetPriority);
+  registry->Register(GetAvailableParallelism);
   registry->Register(GetOSInformation);
 }
 
 }  // namespace os
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(os, node::os::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(os, node::os::RegisterExternalReferences)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(os, node::os::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(os, node::os::RegisterExternalReferences)

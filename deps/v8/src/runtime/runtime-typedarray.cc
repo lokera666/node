@@ -6,12 +6,9 @@
 #include "src/common/message-template.h"
 #include "src/execution/arguments-inl.h"
 #include "src/heap/factory.h"
-#include "src/heap/heap-inl.h"
-#include "src/logging/counters.h"
 #include "src/objects/elements.h"
 #include "src/objects/js-array-buffer-inl.h"
 #include "src/objects/objects-inl.h"
-#include "src/runtime/runtime-utils.h"
 #include "src/runtime/runtime.h"
 
 namespace v8 {
@@ -19,16 +16,33 @@ namespace internal {
 
 RUNTIME_FUNCTION(Runtime_ArrayBufferDetach) {
   HandleScope scope(isolate);
-  DCHECK_EQ(1, args.length());
-  Handle<Object> argument = args.at(0);
   // This runtime function is exposed in ClusterFuzz and as such has to
   // support arbitrary arguments.
-  if (!argument->IsJSArrayBuffer()) {
+  if (args.length() < 1 || !IsJSArrayBuffer(*args.at(0))) {
     THROW_NEW_ERROR_RETURN_FAILURE(
         isolate, NewTypeError(MessageTemplate::kNotTypedArray));
   }
-  Handle<JSArrayBuffer> array_buffer = Handle<JSArrayBuffer>::cast(argument);
-  array_buffer->Detach();
+  auto array_buffer = Cast<JSArrayBuffer>(args.at(0));
+  constexpr bool kForceForWasmMemory = false;
+  MAYBE_RETURN(JSArrayBuffer::Detach(array_buffer, kForceForWasmMemory,
+                                     args.atOrUndefined(isolate, 1)),
+               ReadOnlyRoots(isolate).exception());
+  return ReadOnlyRoots(isolate).undefined_value();
+}
+
+RUNTIME_FUNCTION(Runtime_ArrayBufferSetDetachKey) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());
+  Handle<Object> argument = args.at(0);
+  DirectHandle<Object> key = args.at(1);
+  // This runtime function is exposed in ClusterFuzz and as such has to
+  // support arbitrary arguments.
+  if (!IsJSArrayBuffer(*argument)) {
+    THROW_NEW_ERROR_RETURN_FAILURE(
+        isolate, NewTypeError(MessageTemplate::kNotTypedArray));
+  }
+  auto array_buffer = Cast<JSArrayBuffer>(argument);
+  array_buffer->set_detach_key(*key);
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -46,14 +60,14 @@ RUNTIME_FUNCTION(Runtime_TypedArrayCopyElements) {
 RUNTIME_FUNCTION(Runtime_TypedArrayGetBuffer) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  Handle<JSTypedArray> holder = args.at<JSTypedArray>(0);
+  DirectHandle<JSTypedArray> holder = args.at<JSTypedArray>(0);
   return *holder->GetBuffer();
 }
 
 RUNTIME_FUNCTION(Runtime_GrowableSharedArrayBufferByteLength) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  Handle<JSArrayBuffer> array_buffer = args.at<JSArrayBuffer>(0);
+  DirectHandle<JSArrayBuffer> array_buffer = args.at<JSArrayBuffer>(0);
 
   CHECK_EQ(0, array_buffer->byte_length());
   size_t byte_length = array_buffer->GetBackingStore()->byte_length();
@@ -88,12 +102,12 @@ RUNTIME_FUNCTION(Runtime_TypedArraySortFast) {
   DCHECK_EQ(1, args.length());
 
   // Validation is handled in the Torque builtin.
-  Handle<JSTypedArray> array = args.at<JSTypedArray>(0);
+  DirectHandle<JSTypedArray> array = args.at<JSTypedArray>(0);
   DCHECK(!array->WasDetached());
   DCHECK(!array->IsOutOfBounds());
 
-#if MULTI_MAPPED_ALLOCATOR_AVAILABLE
-  if (FLAG_multi_mapped_mock_allocator) {
+#ifdef V8_OS_LINUX
+  if (v8_flags.multi_mapped_mock_allocator) {
     // Sorting is meaningless with the mock allocator, and std::sort
     // might crash (because aliasing elements violate its assumptions).
     return *array;
@@ -106,8 +120,9 @@ RUNTIME_FUNCTION(Runtime_TypedArraySortFast) {
   // In case of a SAB, the data is copied into temporary memory, as
   // std::sort might crash in case the underlying data is concurrently
   // modified while sorting.
-  CHECK(array->buffer().IsJSArrayBuffer());
-  Handle<JSArrayBuffer> buffer(JSArrayBuffer::cast(array->buffer()), isolate);
+  CHECK(IsJSArrayBuffer(array->buffer()));
+  DirectHandle<JSArrayBuffer> buffer(Cast<JSArrayBuffer>(array->buffer()),
+                                     isolate);
   const bool copy_data = buffer->is_shared();
 
   Handle<ByteArray> array_copy;
@@ -118,7 +133,7 @@ RUNTIME_FUNCTION(Runtime_TypedArraySortFast) {
     if (bytes <= static_cast<unsigned>(
                      ByteArray::LengthFor(kMaxRegularHeapObjectSize))) {
       array_copy = isolate->factory()->NewByteArray(static_cast<int>(bytes));
-      data_copy_ptr = array_copy->GetDataStartAddress();
+      data_copy_ptr = array_copy->begin();
     } else {
       // Allocate copy in C++ heap.
       offheap_copy.resize(bytes);
@@ -136,7 +151,8 @@ RUNTIME_FUNCTION(Runtime_TypedArraySortFast) {
     ctype* data = copy_data ? reinterpret_cast<ctype*>(data_copy_ptr)      \
                             : static_cast<ctype*>(array->DataPtr());       \
     if (kExternal##Type##Array == kExternalFloat64Array ||                 \
-        kExternal##Type##Array == kExternalFloat32Array) {                 \
+        kExternal##Type##Array == kExternalFloat32Array ||                 \
+        kExternal##Type##Array == kExternalFloat16Array) {                 \
       if (COMPRESS_POINTERS_BOOL && alignof(ctype) > kTaggedSize) {        \
         /* TODO(ishell, v8:8875): See UnalignedSlot<T> for details. */     \
         std::sort(UnalignedSlot<ctype>(data),                              \

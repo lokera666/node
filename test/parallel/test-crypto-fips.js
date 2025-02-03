@@ -10,6 +10,7 @@ const path = require('path');
 const fixtures = require('../common/fixtures');
 const { internalBinding } = require('internal/test/binding');
 const { testFipsCrypto } = internalBinding('crypto');
+const { hasOpenSSL3 } = require('../common/crypto');
 
 const FIPS_ENABLED = 1;
 const FIPS_DISABLED = 0;
@@ -77,13 +78,17 @@ testHelper(
   'process.versions',
   process.env);
 
-// By default FIPS should be off in both FIPS and non-FIPS builds.
-testHelper(
-  'stdout',
-  [],
-  FIPS_DISABLED,
-  'require("crypto").getFips()',
-  { ...process.env, 'OPENSSL_CONF': ' ' });
+// By default FIPS should be off in both FIPS and non-FIPS builds
+// unless Node.js was configured using --shared-openssl in
+// which case it may be enabled by the system.
+if (!sharedOpenSSL()) {
+  testHelper(
+    'stdout',
+    [],
+    FIPS_DISABLED,
+    'require("crypto").getFips()',
+    { ...process.env, 'OPENSSL_CONF': ' ' });
+}
 
 // Toggling fips with setFips should not be allowed from a worker thread
 testHelper(
@@ -110,7 +115,7 @@ assert.ok(test_result === 1 || test_result === 0);
 // ("Error: Cannot set FIPS mode in a non-FIPS build.").
 // Due to this uncertainty the following tests are skipped when configured
 // with --shared-openssl.
-if (!sharedOpenSSL() && !common.hasOpenSSL3) {
+if (!sharedOpenSSL() && !hasOpenSSL3) {
   // OpenSSL config file should be able to turn on FIPS mode
   testHelper(
     'stdout',
@@ -140,7 +145,7 @@ if (!sharedOpenSSL() && !common.hasOpenSSL3) {
 // will not work as expected with that version.
 // TODO(danbev) Revisit these test once FIPS support is available in
 // OpenSSL 3.x.
-if (!common.hasOpenSSL3) {
+if (!hasOpenSSL3) {
   testHelper(
     'stdout',
     [`--openssl-config=${CNF_FIPS_OFF}`],

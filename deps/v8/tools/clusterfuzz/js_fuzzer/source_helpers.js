@@ -49,11 +49,28 @@ const BABYLON_OPTIONS = {
 const BABYLON_REPLACE_VAR_OPTIONS = Object.assign({}, BABYLON_OPTIONS);
 BABYLON_REPLACE_VAR_OPTIONS['placeholderPattern'] = /^VAR_[0-9]+$/;
 
+function _idEquals(exp, name) {
+  return babelTypes.isIdentifier(exp) && exp.name == name;
+}
+
+function _isV8NewAPIExecute(exp) {
+  // exp is a member expression resolving to 'd8.file.execute'
+  return (_hasMemberProperty(exp, 'execute') &&
+          _hasMemberProperty(exp.object, 'file') &&
+          _idEquals(exp.object.object, 'd8'));
+}
+
+function _hasMemberProperty(exp, name) {
+  // 'exp' is a member expression with property <name>
+  return babelTypes.isMemberExpression(exp) && _idEquals(exp.property, name);
+}
+
 function _isV8OrSpiderMonkeyLoad(path) {
-  // 'load' and 'loadRelativeToScript' used by V8 and SpiderMonkey.
-  return (babelTypes.isIdentifier(path.node.callee) &&
-          (path.node.callee.name == 'load' ||
-           path.node.callee.name == 'loadRelativeToScript') &&
+  // 'load' and 'loadRelativeToScript' used by V8's old API and SpiderMonkey.
+  // 'd8.file.execute' used by V8's new API.
+  return ((_idEquals(path.node.callee, 'load') ||
+           _idEquals(path.node.callee, 'loadRelativeToScript') ||
+           _isV8NewAPIExecute(path.node.callee)) &&
           path.node.arguments.length == 1 &&
           babelTypes.isStringLiteral(path.node.arguments[0]));
 }
@@ -359,7 +376,7 @@ function removeComments(ast) {
  */
 function cleanAsserts(ast) {
   function replace(string) {
-    return string.replace(/[Aa]ssert/g, '*****t');
+    return string == null ? null : string.replace(/[Aa]ssert/g, '*****t');
   }
   babelTraverse(ast, {
     StringLiteral(path) {
@@ -375,13 +392,20 @@ function cleanAsserts(ast) {
 }
 
 /**
+ * Annotate code with top-level comment.
+ */
+function annotateWithComment(ast, comment) {
+  if (ast.program && ast.program.body && ast.program.body.length > 0) {
+    babelTypes.addComment(
+        ast.program.body[0], 'leading', comment, true);
+  }
+}
+
+/**
  * Annotate code with original file path.
  */
 function annotateWithOriginalPath(ast, relPath) {
-  if (ast.program && ast.program.body && ast.program.body.length > 0) {
-    babelTypes.addComment(
-        ast.program.body[0], 'leading', ' Original: ' + relPath, true);
-  }
+  annotateWithComment(ast, ' Original: ' + relPath);
 }
 
 // TODO(machenbach): Move this into the V8 corpus. Other test suites don't
@@ -449,6 +473,7 @@ function generateCode(source, dependencies=[]) {
 module.exports = {
   BABYLON_OPTIONS: BABYLON_OPTIONS,
   BABYLON_REPLACE_VAR_OPTIONS: BABYLON_REPLACE_VAR_OPTIONS,
+  annotateWithComment: annotateWithComment,
   generateCode: generateCode,
   loadDependencyAbs: loadDependencyAbs,
   loadResource: loadResource,

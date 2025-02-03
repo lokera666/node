@@ -16,8 +16,8 @@ const {
 
 const { once } = require('events');
 
-const { promisify, inspect } = require('util');
-const delay = promisify(setTimeout);
+const { inspect } = require('util');
+const { setTimeout: delay } = require('timers/promises');
 
 // The globals are defined.
 ok(Event);
@@ -65,7 +65,7 @@ let asyncTest = Promise.resolve();
       code: 'ERR_INVALID_ARG_TYPE',
       name: 'TypeError',
       message: 'The "options" argument must be of type object.' +
-               common.invalidArgTypeHelper(i)
+               common.invalidArgTypeHelper(i),
     })
   ));
 }
@@ -126,7 +126,7 @@ let asyncTest = Promise.resolve();
 }
 {
   const ev = new Event('foo');
-  deepStrictEqual(Object.keys(ev), ['isTrusted']);
+  strictEqual(ev.isTrusted, false);
 }
 {
   const eventTarget = new EventTarget();
@@ -141,7 +141,7 @@ let asyncTest = Promise.resolve();
     handleEvent: common.mustCall(function(event) {
       strictEqual(event.type, 'foo');
       strictEqual(this, ev2);
-    })
+    }),
   };
 
   eventTarget.addEventListener('foo', ev1);
@@ -318,7 +318,7 @@ let asyncTest = Promise.resolve();
       code: 'ERR_INVALID_ARG_TYPE',
       name: 'TypeError',
       message: 'The "event" argument must be an instance of Event.' +
-               common.invalidArgTypeHelper(i)
+               common.invalidArgTypeHelper(i),
     });
   });
 
@@ -326,7 +326,7 @@ let asyncTest = Promise.resolve();
     code: 'ERR_INVALID_ARG_TYPE',
     name: 'TypeError',
     message: 'The "listener" argument must be an instance of EventListener.' +
-             common.invalidArgTypeHelper(arg)
+             common.invalidArgTypeHelper(arg),
   });
 
   [
@@ -345,7 +345,9 @@ let asyncTest = Promise.resolve();
 {
   const target = new EventTarget();
   const event = new Event('foo');
+  strictEqual(event.cancelBubble, false);
   event.stopImmediatePropagation();
+  strictEqual(event.cancelBubble, true);
   target.addEventListener('foo', common.mustNotCall());
   target.dispatchEvent(event);
 }
@@ -388,7 +390,7 @@ let asyncTest = Promise.resolve();
   const event = new Event('foo');
   target1.addEventListener('foo', common.mustCall((event) => {
     throws(() => target2.dispatchEvent(event), {
-      code: 'ERR_EVENT_RECURSION'
+      code: 'ERR_EVENT_RECURSION',
     });
   }));
   target1.dispatchEvent(event);
@@ -486,7 +488,7 @@ let asyncTest = Promise.resolve();
     /a/,
   ].forEach((i) => {
     throws(() => target.dispatchEvent.call(i, event), {
-      code: 'ERR_INVALID_THIS'
+      code: 'ERR_INVALID_THIS',
     });
   });
 }
@@ -615,6 +617,15 @@ let asyncTest = Promise.resolve();
   deepStrictEqual(output, [1, 2, 3, 4]);
 }
 {
+  const target = new EventTarget();
+  defineEventHandler(target, 'foo', 'bar');
+  const output = [];
+  target.addEventListener('bar', () => output.push(1));
+  target.onfoo = () => output.push(2);
+  target.dispatchEvent(new Event('bar'));
+  deepStrictEqual(output, [1, 2]);
+}
+{
   const et = new EventTarget();
   const listener = common.mustNotCall();
   et.addEventListener('foo', common.mustCall((e) => {
@@ -627,12 +638,12 @@ let asyncTest = Promise.resolve();
 {
   const ev = new Event('test');
   const evConstructorName = inspect(ev, {
-    depth: -1
+    depth: -1,
   });
   strictEqual(evConstructorName, 'Event');
 
   const inspectResult = inspect(ev, {
-    depth: 1
+    depth: 1,
   });
   ok(inspectResult.includes('Event'));
 }
@@ -640,7 +651,7 @@ let asyncTest = Promise.resolve();
 {
   const et = new EventTarget();
   const inspectResult = inspect(et, {
-    depth: 1
+    depth: 1,
   });
   ok(inspectResult.includes('EventTarget'));
 }
@@ -672,7 +683,73 @@ let asyncTest = Promise.resolve();
   const et = new EventTarget();
   et.addEventListener('foo', common.mustNotCall(), { [kWeakHandler]: {} });
   setImmediate(() => {
-    global.gc();
+    globalThis.gc();
     et.dispatchEvent(new Event('foo'));
   });
+}
+
+{
+  const et = new EventTarget();
+
+  throws(() => et.addEventListener(), {
+    code: 'ERR_MISSING_ARGS',
+    name: 'TypeError',
+  });
+
+  throws(() => et.addEventListener('foo'), {
+    code: 'ERR_MISSING_ARGS',
+    name: 'TypeError',
+  });
+
+  throws(() => et.removeEventListener(), {
+    code: 'ERR_MISSING_ARGS',
+    name: 'TypeError',
+  });
+
+  throws(() => et.removeEventListener('foo'), {
+    code: 'ERR_MISSING_ARGS',
+    name: 'TypeError',
+  });
+
+  throws(() => et.dispatchEvent(), {
+    code: 'ERR_MISSING_ARGS',
+    name: 'TypeError',
+  });
+}
+
+{
+  const et = new EventTarget();
+
+  throws(() => {
+    et.addEventListener(Symbol('symbol'), () => {});
+  }, TypeError);
+
+  throws(() => {
+    et.removeEventListener(Symbol('symbol'), () => {});
+  }, TypeError);
+}
+
+{
+  // Test that event listeners are removed by signal even when
+  // signal's abort event propagation stopped
+  const controller = new AbortController();
+  const { signal } = controller;
+  signal.addEventListener('abort', (e) => e.stopImmediatePropagation(), { once: true });
+  const et = new EventTarget();
+  et.addEventListener('foo', common.mustNotCall(), { signal });
+  controller.abort();
+  et.dispatchEvent(new Event('foo'));
+}
+
+{
+  const event = new Event('foo');
+  strictEqual(event.cancelBubble, false);
+  event.cancelBubble = true;
+  strictEqual(event.cancelBubble, true);
+}
+
+{
+  // A null eventInitDict should not throw an error.
+  new Event('', null);
+  new Event('', undefined);
 }

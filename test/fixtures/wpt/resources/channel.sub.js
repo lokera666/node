@@ -511,7 +511,7 @@
          *
          * @param {SendChannel|string} [dest] - Either a SendChannel
          * to the destination, or the UUID of the destination. If
-         * ommitted, a new UUID is generated, which can be used when
+         * omitted, a new UUID is generated, which can be used when
          * constructing the URL for the global.
          *
          */
@@ -604,7 +604,7 @@
          * @returns {Promise} - Resolved once the channel is disconnected.
          */
         disconnectReader() {
-            // This causes any readers to disconnect until they are explictly reconnected
+            // This causes any readers to disconnect until they are explicitly reconnected
             return this.sendChannel.disconnectReader();
         }
 

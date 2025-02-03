@@ -36,22 +36,22 @@ class JSListFormat
  public:
   // Creates relative time format object with properties derived from input
   // locales and options.
-  static MaybeHandle<JSListFormat> New(Isolate* isolate, Handle<Map> map,
+  static MaybeHandle<JSListFormat> New(Isolate* isolate, DirectHandle<Map> map,
                                        Handle<Object> locales,
                                        Handle<Object> options);
 
-  static Handle<JSObject> ResolvedOptions(Isolate* isolate,
-                                          Handle<JSListFormat> format_holder);
+  static Handle<JSObject> ResolvedOptions(
+      Isolate* isolate, DirectHandle<JSListFormat> format_holder);
 
   // ecma402 #sec-formatlist
   V8_WARN_UNUSED_RESULT static MaybeHandle<String> FormatList(
-      Isolate* isolate, Handle<JSListFormat> format_holder,
-      Handle<FixedArray> list);
+      Isolate* isolate, DirectHandle<JSListFormat> format_holder,
+      DirectHandle<FixedArray> list);
 
   // ecma42 #sec-formatlisttoparts
   V8_WARN_UNUSED_RESULT static MaybeHandle<JSArray> FormatListToParts(
-      Isolate* isolate, Handle<JSListFormat> format_holder,
-      Handle<FixedArray> list);
+      Isolate* isolate, DirectHandle<JSListFormat> format_holder,
+      DirectHandle<FixedArray> list);
 
   V8_EXPORT_PRIVATE static const std::set<std::string>& GetAvailableLocales();
 
@@ -59,7 +59,7 @@ class JSListFormat
   Handle<String> TypeAsString() const;
 
   // ListFormat accessors.
-  DECL_ACCESSORS(icu_formatter, Managed<icu::ListFormatter>)
+  DECL_ACCESSORS(icu_formatter, Tagged<Managed<icu::ListFormatter>>)
 
   // Style: identifying the relative time format style used.
   //
@@ -86,12 +86,12 @@ class JSListFormat
   // Bit positions in |flags|.
   DEFINE_TORQUE_GENERATED_JS_LIST_FORMAT_FLAGS()
 
-  STATIC_ASSERT(Style::LONG <= StyleBits::kMax);
-  STATIC_ASSERT(Style::SHORT <= StyleBits::kMax);
-  STATIC_ASSERT(Style::NARROW <= StyleBits::kMax);
-  STATIC_ASSERT(Type::CONJUNCTION <= TypeBits::kMax);
-  STATIC_ASSERT(Type::DISJUNCTION <= TypeBits::kMax);
-  STATIC_ASSERT(Type::UNIT <= TypeBits::kMax);
+  static_assert(StyleBits::is_valid(Style::LONG));
+  static_assert(StyleBits::is_valid(Style::SHORT));
+  static_assert(StyleBits::is_valid(Style::NARROW));
+  static_assert(TypeBits::is_valid(Type::CONJUNCTION));
+  static_assert(TypeBits::is_valid(Type::DISJUNCTION));
+  static_assert(TypeBits::is_valid(Type::UNIT));
 
   DECL_PRINTER(JSListFormat)
 

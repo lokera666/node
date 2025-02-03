@@ -11,13 +11,11 @@
 
 namespace node {
 namespace crypto {
-static constexpr size_t kMaxDigestMultiplier = 255;
-
 struct HKDFConfig final : public MemoryRetainer {
   CryptoJobMode mode;
   size_t length;
   const EVP_MD* digest;
-  std::shared_ptr<KeyObjectData> key;
+  KeyObjectData key;
   ByteSource salt;
   ByteSource info;
 
@@ -38,7 +36,7 @@ struct HKDFTraits final {
   static constexpr AsyncWrap::ProviderType Provider =
       AsyncWrap::PROVIDER_DERIVEBITSREQUEST;
 
-  static v8::Maybe<bool> AdditionalConfig(
+  static v8::Maybe<void> AdditionalConfig(
       CryptoJobMode mode,
       const v8::FunctionCallbackInfo<v8::Value>& args,
       unsigned int offset,
@@ -49,11 +47,9 @@ struct HKDFTraits final {
       const HKDFConfig& params,
       ByteSource* out);
 
-  static v8::Maybe<bool> EncodeOutput(
-      Environment* env,
-      const HKDFConfig& params,
-      ByteSource* out,
-      v8::Local<v8::Value>* result);
+  static v8::MaybeLocal<v8::Value> EncodeOutput(Environment* env,
+                                                const HKDFConfig& params,
+                                                ByteSource* out);
 };
 
 using HKDFJob = DeriveBitsJob<HKDFTraits>;

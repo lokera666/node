@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -679,6 +679,10 @@ EXT_RETURN tls_construct_ctos_key_share(SSL *s, WPACKET *pkt,
             if (!tls_group_allowed(s, pgroups[i], SSL_SECOP_CURVE_SUPPORTED))
                 continue;
 
+            if (!tls_valid_group(s, pgroups[i], TLS1_3_VERSION, TLS1_3_VERSION,
+                                 0, NULL))
+                continue;
+
             curve_id = pgroups[i];
             break;
         }
@@ -974,7 +978,7 @@ EXT_RETURN tls_construct_ctos_psk(SSL *s, WPACKET *pkt, unsigned int context,
                                   X509 *x, size_t chainidx)
 {
 #ifndef OPENSSL_NO_TLS1_3
-    uint32_t now, agesec, agems = 0;
+    uint32_t agesec, agems = 0;
     size_t reshashsize = 0, pskhashsize = 0, binderoffset, msglen;
     unsigned char *resbinder = NULL, *pskbinder = NULL, *msgstart = NULL;
     const EVP_MD *handmd = NULL, *mdres = NULL, *mdpsk = NULL;
@@ -1030,8 +1034,7 @@ EXT_RETURN tls_construct_ctos_psk(SSL *s, WPACKET *pkt, unsigned int context,
          * this in multiple places in the code, so portability shouldn't be an
          * issue.
          */
-        now = (uint32_t)time(NULL);
-        agesec = now - (uint32_t)s->session->time;
+        agesec = (uint32_t)(time(NULL) - s->session->time);
         /*
          * We calculate the age in seconds but the server may work in ms. Due to
          * rounding errors we could overestimate the age by up to 1s. It is
@@ -1573,7 +1576,8 @@ int tls_parse_stoc_npn(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                                   PACKET_data(pkt),
                                   PACKET_remaining(pkt),
                                   s->ctx->ext.npn_select_cb_arg) !=
-             SSL_TLSEXT_ERR_OK) {
+                                  SSL_TLSEXT_ERR_OK
+            || selected_len == 0) {
         SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, SSL_R_BAD_EXTENSION);
         return 0;
     }
@@ -1602,6 +1606,8 @@ int tls_parse_stoc_alpn(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                         size_t chainidx)
 {
     size_t len;
+    PACKET confpkt, protpkt;
+    int valid = 0;
 
     /* We must have requested it. */
     if (!s->s3.alpn_sent) {
@@ -1620,6 +1626,28 @@ int tls_parse_stoc_alpn(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
         return 0;
     }
+
+    /* It must be a protocol that we sent */
+    if (!PACKET_buf_init(&confpkt, s->ext.alpn, s->ext.alpn_len)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    while (PACKET_get_length_prefixed_1(&confpkt, &protpkt)) {
+        if (PACKET_remaining(&protpkt) != len)
+            continue;
+        if (memcmp(PACKET_data(pkt), PACKET_data(&protpkt), len) == 0) {
+            /* Valid protocol found */
+            valid = 1;
+            break;
+        }
+    }
+
+    if (!valid) {
+        /* The protocol sent from the server does not match one we advertised */
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
+        return 0;
+    }
+
     OPENSSL_free(s->s3.alpn_selected);
     s->s3.alpn_selected = OPENSSL_malloc(len);
     if (s->s3.alpn_selected == NULL) {
@@ -1816,7 +1844,9 @@ int tls_parse_stoc_key_share(SSL *s, PACKET *pkt, unsigned int context, X509 *x,
                 break;
         }
         if (i >= num_groups
-                || !tls_group_allowed(s, group_id, SSL_SECOP_CURVE_SUPPORTED)) {
+                || !tls_group_allowed(s, group_id, SSL_SECOP_CURVE_SUPPORTED)
+                || !tls_valid_group(s, group_id, TLS1_3_VERSION, TLS1_3_VERSION,
+                                    0, NULL)) {
             SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_KEY_SHARE);
             return 0;
         }

@@ -45,25 +45,48 @@ TEST(NameTraitTest, InternalNamesHiddenInOfficialBuild) {
   // (b) avoid exposing internal types until it has been clarified whether
   //     exposing internals in DevTools is fine.
 #if defined(OFFICIAL_BUILD)
-  EXPECT_TRUE(NameProvider::HideInternalNames());
+  EXPECT_FALSE(NameProvider::SupportsCppClassNamesAsObjectNames());
 #endif
 }
 
 TEST(NameTraitTest, DefaultName) {
-  EXPECT_STREQ(NameProvider::HideInternalNames()
-                   ? "InternalNode"
-                   : "cppgc::internal::(anonymous namespace)::NoName",
-               NameTrait<NoName>::GetName(nullptr).value);
-  EXPECT_STREQ(NameProvider::HideInternalNames()
-                   ? "InternalNode"
-                   : "cppgc::internal::(anonymous namespace)::OtherNoName",
-               NameTrait<OtherNoName>::GetName(nullptr).value);
+  EXPECT_STREQ(
+      NameProvider::SupportsCppClassNamesAsObjectNames()
+          ? "cppgc::internal::(anonymous namespace)::NoName"
+          : "InternalNode",
+      NameTrait<NoName>::GetName(
+          nullptr, HeapObjectNameForUnnamedObject::kUseClassNameIfSupported)
+          .value);
+  EXPECT_STREQ(
+      NameProvider::SupportsCppClassNamesAsObjectNames()
+          ? "cppgc::internal::(anonymous namespace)::OtherNoName"
+          : "InternalNode",
+      NameTrait<OtherNoName>::GetName(
+          nullptr, HeapObjectNameForUnnamedObject::kUseClassNameIfSupported)
+          .value);
+  // The following ignores `NameProvider::SupportsCppClassNamesAsObjectNames()`
+  // and just always returns the hidden name, independent of the build support.
+  EXPECT_STREQ("InternalNode",
+               NameTrait<NoName>::GetName(
+                   nullptr, HeapObjectNameForUnnamedObject::kUseHiddenName)
+                   .value);
+  EXPECT_STREQ("InternalNode",
+               NameTrait<OtherNoName>::GetName(
+                   nullptr, HeapObjectNameForUnnamedObject::kUseHiddenName)
+                   .value);
 }
 
 TEST(NameTraitTest, CustomName) {
   ClassWithName with_name("CustomName");
-  const char* name = NameTrait<ClassWithName>::GetName(&with_name).value;
-  EXPECT_STREQ("CustomName", name);
+  EXPECT_STREQ(
+      "CustomName",
+      NameTrait<ClassWithName>::GetName(
+          &with_name, HeapObjectNameForUnnamedObject::kUseClassNameIfSupported)
+          .value);
+  EXPECT_STREQ("CustomName",
+               NameTrait<ClassWithName>::GetName(
+                   &with_name, HeapObjectNameForUnnamedObject::kUseHiddenName)
+                   .value);
 }
 
 namespace {
@@ -79,7 +102,7 @@ class TraitTester : public NameTraitBase {
 TEST(NameTraitTest, NoTypeAvailable) {
   HeapObjectName name = TraitTester::GetNameFromTypeSignature(nullptr);
   EXPECT_STREQ(NameProvider::kNoNameDeducible, name.value);
-  EXPECT_TRUE(name.name_was_hidden);
+  EXPECT_FALSE(name.name_was_hidden);
 }
 
 TEST(NameTraitTest, ParsingPrettyFunction) {
@@ -99,12 +122,17 @@ class HeapObjectHeaderNameTest : public testing::TestWithHeap {};
 TEST_F(HeapObjectHeaderNameTest, LookupNameThroughGCInfo) {
   auto* no_name = MakeGarbageCollected<NoName>(GetAllocationHandle());
   auto no_name_tuple = HeapObjectHeader::FromObject(no_name).GetName();
-  if (NameProvider::HideInternalNames()) {
-    EXPECT_STREQ(NameProvider::kHiddenName, no_name_tuple.value);
-    EXPECT_TRUE(no_name_tuple.name_was_hidden);
-  } else {
+  EXPECT_STREQ(NameProvider::kHiddenName, no_name_tuple.value);
+  EXPECT_TRUE(no_name_tuple.name_was_hidden);
+
+  ClassNameAsHeapObjectNameScope class_names_scope(*Heap::From(GetHeap()));
+  no_name_tuple = HeapObjectHeader::FromObject(no_name).GetName();
+  if (NameProvider::SupportsCppClassNamesAsObjectNames()) {
     EXPECT_STREQ("cppgc::internal::(anonymous namespace)::NoName",
                  no_name_tuple.value);
+    EXPECT_FALSE(no_name_tuple.name_was_hidden);
+  } else {
+    EXPECT_STREQ(NameProvider::kHiddenName, no_name_tuple.value);
     EXPECT_FALSE(no_name_tuple.name_was_hidden);
   }
 
@@ -112,12 +140,12 @@ TEST_F(HeapObjectHeaderNameTest, LookupNameThroughGCInfo) {
       MakeGarbageCollected<OtherNoName>(GetAllocationHandle());
   auto other_no_name_tuple =
       HeapObjectHeader::FromObject(other_no_name).GetName();
-  if (NameProvider::HideInternalNames()) {
-    EXPECT_STREQ(NameProvider::kHiddenName, no_name_tuple.value);
-    EXPECT_TRUE(no_name_tuple.name_was_hidden);
-  } else {
+  if (NameProvider::SupportsCppClassNamesAsObjectNames()) {
     EXPECT_STREQ("cppgc::internal::(anonymous namespace)::OtherNoName",
                  other_no_name_tuple.value);
+    EXPECT_FALSE(other_no_name_tuple.name_was_hidden);
+  } else {
+    EXPECT_STREQ(NameProvider::kHiddenName, other_no_name_tuple.value);
     EXPECT_FALSE(other_no_name_tuple.name_was_hidden);
   }
 

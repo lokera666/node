@@ -4,7 +4,7 @@
 // but using a net server/client instead
 
 require('../common');
-const onGC = require('../common/ongc');
+const { onGC } = require('../common/gc');
 const assert = require('assert');
 const net = require('net');
 const os = require('os');
@@ -26,7 +26,7 @@ function serverHandler(sock) {
   }, 100);
 }
 
-const cpus = os.cpus().length;
+const cpus = os.availableParallelism();
 let createClients = true;
 let done = 0;
 let count = 0;
@@ -64,7 +64,7 @@ setImmediate(status);
 function status() {
   if (done > 0) {
     createClients = false;
-    global.gc();
+    globalThis.gc();
     console.log(`done/collected/total: ${done}/${countGC}/${count}`);
     if (countGC === count) {
       server.close();

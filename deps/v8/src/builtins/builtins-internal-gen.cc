@@ -2,32 +2,30 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <optional>
+
 #include "src/api/api.h"
 #include "src/baseline/baseline.h"
+#include "src/builtins/builtins-inl.h"
 #include "src/builtins/builtins-utils-gen.h"
-#include "src/builtins/builtins.h"
-#include "src/codegen/code-stub-assembler.h"
+#include "src/codegen/code-stub-assembler-inl.h"
 #include "src/codegen/interface-descriptors-inl.h"
-#include "src/codegen/macro-assembler.h"
+#include "src/codegen/macro-assembler-inl.h"
 #include "src/common/globals.h"
 #include "src/execution/frame-constants.h"
-#include "src/heap/memory-chunk.h"
+#include "src/heap/mutable-page-metadata.h"
 #include "src/ic/accessor-assembler.h"
 #include "src/ic/keyed-store-generic.h"
 #include "src/logging/counters.h"
 #include "src/objects/debug-objects.h"
+#include "src/objects/scope-info.h"
 #include "src/objects/shared-function-info.h"
 #include "src/runtime/runtime.h"
 
 namespace v8 {
 namespace internal {
 
-// -----------------------------------------------------------------------------
-// Stack checks.
-
-void Builtins::Generate_StackCheck(MacroAssembler* masm) {
-  masm->TailCallRuntime(Runtime::kStackGuard);
-}
+#include "src/codegen/define-code-stub-assembler-macros.inc"
 
 // -----------------------------------------------------------------------------
 // TurboFan support builtins.
@@ -88,29 +86,24 @@ TF_BUILTIN(DebugBreakTrampoline, CodeStubAssembler) {
   auto function = Parameter<JSFunction>(Descriptor::kJSTarget);
 
   // Check break-at-entry flag on the debug info.
+  TNode<ExternalReference> f =
+      ExternalConstant(ExternalReference::debug_break_at_entry_function());
+  TNode<ExternalReference> isolate_ptr =
+      ExternalConstant(ExternalReference::isolate_address());
   TNode<SharedFunctionInfo> shared =
       CAST(LoadObjectField(function, JSFunction::kSharedFunctionInfoOffset));
-  TNode<Object> maybe_heap_object_or_smi =
-      LoadObjectField(shared, SharedFunctionInfo::kScriptOrDebugInfoOffset);
-  TNode<HeapObject> maybe_debug_info =
-      TaggedToHeapObject(maybe_heap_object_or_smi, &tailcall_to_shared);
-  GotoIfNot(HasInstanceType(maybe_debug_info, InstanceType::DEBUG_INFO_TYPE),
-            &tailcall_to_shared);
+  TNode<IntPtrT> result = UncheckedCast<IntPtrT>(
+      CallCFunction(f, MachineType::UintPtr(),
+                    std::make_pair(MachineType::Pointer(), isolate_ptr),
+                    std::make_pair(MachineType::TaggedPointer(), shared)));
+  GotoIf(IntPtrEqual(result, IntPtrConstant(0)), &tailcall_to_shared);
 
-  {
-    TNode<DebugInfo> debug_info = CAST(maybe_debug_info);
-    TNode<Smi> flags =
-        CAST(LoadObjectField(debug_info, DebugInfo::kFlagsOffset));
-    GotoIfNot(SmiToInt32(SmiAnd(flags, SmiConstant(DebugInfo::kBreakAtEntry))),
-              &tailcall_to_shared);
-
-    CallRuntime(Runtime::kDebugBreakAtEntry, context, function);
-    Goto(&tailcall_to_shared);
-  }
+  CallRuntime(Runtime::kDebugBreakAtEntry, context, function);
+  Goto(&tailcall_to_shared);
 
   BIND(&tailcall_to_shared);
   // Tail call into code object on the SharedFunctionInfo.
-  TNode<CodeT> code = GetSharedFunctionInfoCode(shared);
+  TNode<Code> code = GetSharedFunctionInfoCode(shared);
   TailCallJSCode(code, context, function, new_target, arg_count);
 }
 
@@ -125,62 +118,45 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
     return Word32NotEqual(Load<Uint8T>(is_marking_addr), Int32Constant(0));
   }
 
-  TNode<BoolT> IsPageFlagSet(TNode<IntPtrT> object, int mask) {
-    TNode<IntPtrT> page = PageFromAddress(object);
-    TNode<IntPtrT> flags = UncheckedCast<IntPtrT>(
-        Load(MachineType::Pointer(), page,
-             IntPtrConstant(BasicMemoryChunk::kFlagsOffset)));
-    return WordNotEqual(WordAnd(flags, IntPtrConstant(mask)),
-                        IntPtrConstant(0));
+  TNode<BoolT> IsMinorMarking() {
+    TNode<ExternalReference> is_minor_marking_addr = ExternalConstant(
+        ExternalReference::heap_is_minor_marking_flag_address(this->isolate()));
+    return Word32NotEqual(Load<Uint8T>(is_minor_marking_addr),
+                          Int32Constant(0));
   }
 
-  TNode<BoolT> IsWhite(TNode<IntPtrT> object) {
-    DCHECK_EQ(strcmp(Marking::kWhiteBitPattern, "00"), 0);
+  TNode<BoolT> IsSharedSpaceIsolate() {
+    TNode<ExternalReference> is_shared_space_isolate_addr = ExternalConstant(
+        ExternalReference::is_shared_space_isolate_flag_address(
+            this->isolate()));
+    return Word32NotEqual(Load<Uint8T>(is_shared_space_isolate_addr),
+                          Int32Constant(0));
+  }
+
+  TNode<BoolT> UsesSharedHeap() {
+    TNode<ExternalReference> uses_shared_heap_addr =
+        IsolateField(IsolateFieldId::kUsesSharedHeapFlag);
+    return Word32NotEqual(Load<Uint8T>(uses_shared_heap_addr),
+                          Int32Constant(0));
+  }
+
+  TNode<BoolT> IsUnmarked(TNode<IntPtrT> object) {
     TNode<IntPtrT> cell;
     TNode<IntPtrT> mask;
     GetMarkBit(object, &cell, &mask);
-    TNode<Int32T> mask32 = TruncateIntPtrToInt32(mask);
-    // Non-white has 1 for the first bit, so we only need to check for the first
-    // bit.
-    return Word32Equal(Word32And(Load<Int32T>(cell), mask32), Int32Constant(0));
-  }
-
-  void GetMarkBit(TNode<IntPtrT> object, TNode<IntPtrT>* cell,
-                  TNode<IntPtrT>* mask) {
-    TNode<IntPtrT> page = PageFromAddress(object);
-    TNode<IntPtrT> bitmap =
-        IntPtrAdd(page, IntPtrConstant(MemoryChunk::kMarkingBitmapOffset));
-
-    {
-      // Temp variable to calculate cell offset in bitmap.
-      TNode<WordT> r0;
-      int shift = Bitmap::kBitsPerCellLog2 + kTaggedSizeLog2 -
-                  Bitmap::kBytesPerCellLog2;
-      r0 = WordShr(object, IntPtrConstant(shift));
-      r0 = WordAnd(r0, IntPtrConstant((kPageAlignmentMask >> shift) &
-                                      ~(Bitmap::kBytesPerCell - 1)));
-      *cell = IntPtrAdd(bitmap, Signed(r0));
-    }
-    {
-      // Temp variable to calculate bit offset in cell.
-      TNode<WordT> r1;
-      r1 = WordShr(object, IntPtrConstant(kTaggedSizeLog2));
-      r1 = WordAnd(r1, IntPtrConstant((1 << Bitmap::kBitsPerCellLog2) - 1));
-      // It seems that LSB(e.g. cl) is automatically used, so no manual masking
-      // is needed. Uncomment the following line otherwise.
-      // WordAnd(r1, IntPtrConstant((1 << kBitsPerByte) - 1)));
-      *mask = WordShl(IntPtrConstant(1), r1);
-    }
+    // Marked only requires checking a single bit here.
+    return WordEqual(WordAnd(Load<IntPtrT>(cell), mask), IntPtrConstant(0));
   }
 
   void InsertIntoRememberedSet(TNode<IntPtrT> object, TNode<IntPtrT> slot,
                                SaveFPRegsMode fp_mode) {
     Label slow_path(this), next(this);
-    TNode<IntPtrT> page = PageFromAddress(object);
+    TNode<IntPtrT> chunk = MemoryChunkFromAddress(object);
+    TNode<IntPtrT> page = PageMetadataFromMemoryChunk(chunk);
 
     // Load address of SlotSet
     TNode<IntPtrT> slot_set = LoadSlotSet(page, &slow_path);
-    TNode<IntPtrT> slot_offset = IntPtrSub(slot, page);
+    TNode<IntPtrT> slot_offset = IntPtrSub(slot, chunk);
 
     // Load bucket
     TNode<IntPtrT> bucket = LoadBucket(slot_set, slot_offset, &slow_path);
@@ -196,7 +172,7 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
       CallCFunctionWithCallerSavedRegisters(
           function, MachineTypeOf<Int32T>::value, fp_mode,
           std::make_pair(MachineTypeOf<IntPtrT>::value, page),
-          std::make_pair(MachineTypeOf<IntPtrT>::value, slot));
+          std::make_pair(MachineTypeOf<IntPtrT>::value, slot_offset));
       Goto(&next);
     }
 
@@ -206,7 +182,7 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
   TNode<IntPtrT> LoadSlotSet(TNode<IntPtrT> page, Label* slow_path) {
     TNode<IntPtrT> slot_set = UncheckedCast<IntPtrT>(
         Load(MachineType::Pointer(), page,
-             IntPtrConstant(MemoryChunk::kOldToNewSlotSetOffset)));
+             IntPtrConstant(MutablePageMetadata::kOldToNewSlotSetOffset)));
     GotoIf(WordEqual(slot_set, IntPtrConstant(0)), slow_path);
     return slot_set;
   }
@@ -245,94 +221,191 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
                         TruncateIntPtrToInt32(new_cell_value));
   }
 
-  void GenerationalWriteBarrier(SaveFPRegsMode fp_mode) {
-    Label incremental_wb(this), test_old_to_young_flags(this),
-        remembered_set_only(this), remembered_set_and_incremental_wb(this),
-        next(this);
+  void WriteBarrier(SaveFPRegsMode fp_mode) {
+    Label marking_is_on(this), marking_is_off(this), next(this);
 
-    // When incremental marking is not on, we skip cross generation pointer
-    // checking here, because there are checks for
-    // `kPointersFromHereAreInterestingMask` and
-    // `kPointersToHereAreInterestingMask` in
-    // `src/compiler/<arch>/code-generator-<arch>.cc` before calling this
-    // stub, which serves as the cross generation checking.
     auto slot =
         UncheckedParameter<IntPtrT>(WriteBarrierDescriptor::kSlotAddress);
-    Branch(IsMarking(), &test_old_to_young_flags, &remembered_set_only);
+    Branch(IsMarking(), &marking_is_on, &marking_is_off);
 
-    BIND(&test_old_to_young_flags);
-    {
-      // TODO(ishell): do a new-space range check instead.
-      TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
+    BIND(&marking_is_off);
+    GenerationalOrSharedBarrierSlow(slot, &next, fp_mode);
 
-      // TODO(albertnetymk): Try to cache the page flag for value and
-      // object, instead of calling IsPageFlagSet each time.
-      TNode<BoolT> value_is_young =
-          IsPageFlagSet(value, MemoryChunk::kIsInYoungGenerationMask);
-      GotoIfNot(value_is_young, &incremental_wb);
-
-      TNode<IntPtrT> object = BitcastTaggedToWord(
-          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
-      TNode<BoolT> object_is_young =
-          IsPageFlagSet(object, MemoryChunk::kIsInYoungGenerationMask);
-      Branch(object_is_young, &incremental_wb,
-             &remembered_set_and_incremental_wb);
-    }
-
-    BIND(&remembered_set_only);
-    {
-      TNode<IntPtrT> object = BitcastTaggedToWord(
-          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
-      InsertIntoRememberedSet(object, slot, fp_mode);
-      Goto(&next);
-    }
-
-    BIND(&remembered_set_and_incremental_wb);
-    {
-      TNode<IntPtrT> object = BitcastTaggedToWord(
-          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
-      InsertIntoRememberedSet(object, slot, fp_mode);
-      Goto(&incremental_wb);
-    }
-
-    BIND(&incremental_wb);
-    {
-      TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
-      IncrementalWriteBarrier(slot, value, fp_mode);
-      Goto(&next);
-    }
+    BIND(&marking_is_on);
+    WriteBarrierDuringMarking(slot, &next, fp_mode);
 
     BIND(&next);
   }
 
-  void IncrementalWriteBarrier(SaveFPRegsMode fp_mode) {
-    auto slot =
-        UncheckedParameter<IntPtrT>(WriteBarrierDescriptor::kSlotAddress);
-    TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
-    IncrementalWriteBarrier(slot, value, fp_mode);
+  void IndirectPointerWriteBarrier(SaveFPRegsMode fp_mode) {
+    CSA_DCHECK(this, IsMarking());
+
+    // For this barrier, the slot contains an index into a pointer table and not
+    // directly a pointer to a HeapObject. Further, the slot address is tagged
+    // with the indirect pointer tag of the slot, so it cannot directly be
+    // dereferenced but needs to be decoded first.
+    TNode<IntPtrT> slot = UncheckedParameter<IntPtrT>(
+        IndirectPointerWriteBarrierDescriptor::kSlotAddress);
+    TNode<IntPtrT> object = BitcastTaggedToWord(UncheckedParameter<Object>(
+        IndirectPointerWriteBarrierDescriptor::kObject));
+    TNode<IntPtrT> tag = UncheckedParameter<IntPtrT>(
+        IndirectPointerWriteBarrierDescriptor::kIndirectPointerTag);
+
+    TNode<ExternalReference> function = ExternalConstant(
+        ExternalReference::
+            write_barrier_indirect_pointer_marking_from_code_function());
+    CallCFunctionWithCallerSavedRegisters(
+        function, MachineTypeOf<Int32T>::value, fp_mode,
+        std::make_pair(MachineTypeOf<IntPtrT>::value, object),
+        std::make_pair(MachineTypeOf<IntPtrT>::value, slot),
+        std::make_pair(MachineTypeOf<IntPtrT>::value, tag));
   }
 
-  void IncrementalWriteBarrier(TNode<IntPtrT> slot, TNode<IntPtrT> value,
-                               SaveFPRegsMode fp_mode) {
-    Label call_incremental_wb(this), next(this);
+  void GenerationalOrSharedBarrierSlow(TNode<IntPtrT> slot, Label* next,
+                                       SaveFPRegsMode fp_mode) {
+    // When incremental marking is not on, the fast and out-of-line fast path of
+    // the write barrier already checked whether we need to run the generational
+    // or shared barrier slow path.
+    Label generational_barrier(this), shared_barrier(this);
 
-    // There are two cases we need to call incremental write barrier.
-    // 1) value_is_white
-    GotoIf(IsWhite(value), &call_incremental_wb);
+    TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
 
-    // 2) is_compacting && value_in_EC && obj_isnt_skip
-    // is_compacting = true when is_marking = true
-    GotoIfNot(IsPageFlagSet(value, MemoryChunk::kEvacuationCandidateMask),
-              &next);
+    InYoungGeneration(value, &generational_barrier, &shared_barrier);
 
-    {
-      TNode<IntPtrT> object = BitcastTaggedToWord(
-          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
-      Branch(
-          IsPageFlagSet(object, MemoryChunk::kSkipEvacuationSlotsRecordingMask),
-          &next, &call_incremental_wb);
+    BIND(&generational_barrier);
+    if (!v8_flags.sticky_mark_bits) {
+      CSA_DCHECK(this,
+                 IsPageFlagSet(value, MemoryChunk::kIsInYoungGenerationMask));
     }
-    BIND(&call_incremental_wb);
+    GenerationalBarrierSlow(slot, next, fp_mode);
+
+    // TODO(333906585): With sticky-mark bits and without the shared barrier
+    // support, we actually never jump here. Don't put it under the flag though,
+    // since the assert below has been useful.
+    BIND(&shared_barrier);
+    CSA_DCHECK(this, IsPageFlagSet(value, MemoryChunk::kInSharedHeap));
+    SharedBarrierSlow(slot, next, fp_mode);
+  }
+
+  void GenerationalBarrierSlow(TNode<IntPtrT> slot, Label* next,
+                               SaveFPRegsMode fp_mode) {
+    TNode<IntPtrT> object = BitcastTaggedToWord(
+        UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+    InsertIntoRememberedSet(object, slot, fp_mode);
+    Goto(next);
+  }
+
+  void SharedBarrierSlow(TNode<IntPtrT> slot, Label* next,
+                         SaveFPRegsMode fp_mode) {
+    TNode<ExternalReference> function = ExternalConstant(
+        ExternalReference::shared_barrier_from_code_function());
+    TNode<IntPtrT> object = BitcastTaggedToWord(
+        UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+    CallCFunctionWithCallerSavedRegisters(
+        function, MachineTypeOf<Int32T>::value, fp_mode,
+        std::make_pair(MachineTypeOf<IntPtrT>::value, object),
+        std::make_pair(MachineTypeOf<IntPtrT>::value, slot));
+    Goto(next);
+  }
+
+  void WriteBarrierDuringMarking(TNode<IntPtrT> slot, Label* next,
+                                 SaveFPRegsMode fp_mode) {
+    // When incremental marking is on, we need to perform generational, shared
+    // and incremental marking write barrier.
+    Label incremental_barrier(this);
+
+    GenerationalOrSharedBarrierDuringMarking(slot, &incremental_barrier,
+                                             fp_mode);
+
+    BIND(&incremental_barrier);
+    IncrementalWriteBarrier(slot, fp_mode);
+    Goto(next);
+  }
+
+  void GenerationalOrSharedBarrierDuringMarking(TNode<IntPtrT> slot,
+                                                Label* next,
+                                                SaveFPRegsMode fp_mode) {
+    Label generational_barrier_check(this), shared_barrier_check(this),
+        shared_barrier_slow(this), generational_barrier_slow(this);
+
+    // During incremental marking we always reach this slow path, so we need to
+    // check whether this is an old-to-new or old-to-shared reference.
+    TNode<IntPtrT> object = BitcastTaggedToWord(
+        UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+
+    if (!v8_flags.sticky_mark_bits) {
+      // With sticky markbits we know everything will be old after the GC so no
+      // need to check the age.
+      InYoungGeneration(object, next, &generational_barrier_check);
+
+      BIND(&generational_barrier_check);
+    }
+
+    TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
+
+    if (!v8_flags.sticky_mark_bits) {
+      // With sticky markbits we know everything will be old after the GC so no
+      // need to track old-to-new references.
+      InYoungGeneration(value, &generational_barrier_slow,
+                        &shared_barrier_check);
+
+      BIND(&generational_barrier_slow);
+      GenerationalBarrierSlow(slot, next, fp_mode);
+
+      BIND(&shared_barrier_check);
+    }
+
+    InSharedHeap(value, &shared_barrier_slow, next);
+
+    BIND(&shared_barrier_slow);
+
+    SharedBarrierSlow(slot, next, fp_mode);
+  }
+
+  void InYoungGeneration(TNode<IntPtrT> object, Label* true_label,
+                         Label* false_label) {
+    if (v8_flags.sticky_mark_bits) {
+      // This method is currently only used when marking is disabled. Checking
+      // markbits while marking is active may result in unexpected results.
+      CSA_DCHECK(this, Word32Equal(IsMarking(), BoolConstant(false)));
+
+      Label not_read_only(this);
+
+      TNode<BoolT> is_read_only_page =
+          IsPageFlagSet(object, MemoryChunk::kIsOnlyOldOrMajorGCInProgressMask);
+      Branch(is_read_only_page, false_label, &not_read_only);
+
+      BIND(&not_read_only);
+      Branch(IsUnmarked(object), true_label, false_label);
+    } else {
+      TNode<BoolT> object_is_young =
+          IsPageFlagSet(object, MemoryChunk::kIsInYoungGenerationMask);
+      Branch(object_is_young, true_label, false_label);
+    }
+  }
+
+  void InSharedHeap(TNode<IntPtrT> object, Label* true_label,
+                    Label* false_label) {
+    TNode<BoolT> object_is_young =
+        IsPageFlagSet(object, MemoryChunk::kInSharedHeap);
+
+    Branch(object_is_young, true_label, false_label);
+  }
+
+  void IncrementalWriteBarrierMinor(TNode<IntPtrT> slot, TNode<IntPtrT> value,
+                                    SaveFPRegsMode fp_mode, Label* next) {
+    Label check_is_unmarked(this, Label::kDeferred);
+
+    if (!v8_flags.sticky_mark_bits) {
+      // With sticky markbits, InYoungGeneration and IsUnmarked below are
+      // equivalent.
+      InYoungGeneration(value, &check_is_unmarked, next);
+
+      BIND(&check_is_unmarked);
+    }
+
+    GotoIfNot(IsUnmarked(value), next);
+
     {
       TNode<ExternalReference> function = ExternalConstant(
           ExternalReference::write_barrier_marking_from_code_function());
@@ -342,25 +415,155 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
           function, MachineTypeOf<Int32T>::value, fp_mode,
           std::make_pair(MachineTypeOf<IntPtrT>::value, object),
           std::make_pair(MachineTypeOf<IntPtrT>::value, slot));
-      Goto(&next);
+      Goto(next);
     }
+  }
+
+  void IncrementalWriteBarrierMajor(TNode<IntPtrT> slot, TNode<IntPtrT> value,
+                                    SaveFPRegsMode fp_mode, Label* next) {
+    Label marking_cpp_slow_path(this);
+
+    IsValueUnmarkedOrRecordSlot(value, &marking_cpp_slow_path, next);
+
+    BIND(&marking_cpp_slow_path);
+    {
+      TNode<ExternalReference> function = ExternalConstant(
+          ExternalReference::write_barrier_marking_from_code_function());
+      TNode<IntPtrT> object = BitcastTaggedToWord(
+          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+      CallCFunctionWithCallerSavedRegisters(
+          function, MachineTypeOf<Int32T>::value, fp_mode,
+          std::make_pair(MachineTypeOf<IntPtrT>::value, object),
+          std::make_pair(MachineTypeOf<IntPtrT>::value, slot));
+      Goto(next);
+    }
+  }
+
+  void IsValueUnmarkedOrRecordSlot(TNode<IntPtrT> value, Label* true_label,
+                                   Label* false_label) {
+    // This code implements the following condition:
+    // IsUnmarked(value) ||
+    //   OnEvacuationCandidate(value) &&
+    //   !SkipEvacuationCandidateRecording(value)
+
+    // 1) IsUnmarked(value) || ....
+    GotoIf(IsUnmarked(value), true_label);
+
+    // 2) OnEvacuationCandidate(value) &&
+    //    !SkipEvacuationCandidateRecording(value)
+    GotoIfNot(IsPageFlagSet(value, MemoryChunk::kEvacuationCandidateMask),
+              false_label);
+
+    {
+      TNode<IntPtrT> object = BitcastTaggedToWord(
+          UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+      Branch(
+          IsPageFlagSet(object, MemoryChunk::kSkipEvacuationSlotsRecordingMask),
+          false_label, true_label);
+    }
+  }
+
+  void IncrementalWriteBarrier(TNode<IntPtrT> slot, SaveFPRegsMode fp_mode) {
+    Label next(this), write_into_shared_object(this),
+        write_into_local_object(this),
+        local_object_and_value(this, Label::kDeferred);
+
+    TNode<IntPtrT> object = BitcastTaggedToWord(
+        UncheckedParameter<Object>(WriteBarrierDescriptor::kObject));
+    TNode<IntPtrT> value = BitcastTaggedToWord(Load<HeapObject>(slot));
+
+    // Without a shared heap, all objects are local. This is the fast path
+    // always used when no shared heap exists.
+    GotoIfNot(UsesSharedHeap(), &local_object_and_value);
+
+    // From the point-of-view of the shared space isolate (= the main isolate)
+    // shared heap objects are just local objects.
+    GotoIf(IsSharedSpaceIsolate(), &local_object_and_value);
+
+    // These checks here are now only reached by client isolates (= worker
+    // isolates). Now first check whether incremental marking is activated for
+    // that particular object's space. Incrementally marking might only be
+    // enabled for either local or shared objects on client isolates.
+    GotoIfNot(IsPageFlagSet(object, MemoryChunk::kIncrementalMarking), &next);
+
+    // We now know that incremental marking is enabled for the given object.
+    // Decide whether to run the shared or local incremental marking barrier.
+    InSharedHeap(object, &write_into_shared_object, &write_into_local_object);
+
+    BIND(&write_into_shared_object);
+
+    // Run the shared incremental marking barrier.
+    IncrementalWriteBarrierShared(object, slot, value, fp_mode, &next);
+
+    BIND(&write_into_local_object);
+
+    // When writing into a local object we can ignore stores of shared object
+    // values since for those no slot recording or marking is required.
+    InSharedHeap(value, &next, &local_object_and_value);
+
+    // Both object and value are now guaranteed to be local objects, run the
+    // local incremental marking barrier.
+    BIND(&local_object_and_value);
+    IncrementalWriteBarrierLocal(slot, value, fp_mode, &next);
+
     BIND(&next);
   }
 
-  void GenerateRecordWrite(RememberedSetAction rs_mode,
-                           SaveFPRegsMode fp_mode) {
+  void IncrementalWriteBarrierShared(TNode<IntPtrT> object, TNode<IntPtrT> slot,
+                                     TNode<IntPtrT> value,
+                                     SaveFPRegsMode fp_mode, Label* next) {
+    Label shared_marking_cpp_slow_path(this);
+
+    IsValueUnmarkedOrRecordSlot(value, &shared_marking_cpp_slow_path, next);
+
+    BIND(&shared_marking_cpp_slow_path);
+    {
+      TNode<ExternalReference> function = ExternalConstant(
+          ExternalReference::write_barrier_shared_marking_from_code_function());
+      CallCFunctionWithCallerSavedRegisters(
+          function, MachineTypeOf<Int32T>::value, fp_mode,
+          std::make_pair(MachineTypeOf<IntPtrT>::value, object),
+          std::make_pair(MachineTypeOf<IntPtrT>::value, slot));
+
+      Goto(next);
+    }
+  }
+
+  void IncrementalWriteBarrierLocal(TNode<IntPtrT> slot, TNode<IntPtrT> value,
+                                    SaveFPRegsMode fp_mode, Label* next) {
+    Label is_minor(this), is_major(this);
+    Branch(IsMinorMarking(), &is_minor, &is_major);
+
+    BIND(&is_minor);
+    IncrementalWriteBarrierMinor(slot, value, fp_mode, next);
+
+    BIND(&is_major);
+    IncrementalWriteBarrierMajor(slot, value, fp_mode, next);
+  }
+
+  void GenerateRecordWrite(SaveFPRegsMode fp_mode) {
     if (V8_DISABLE_WRITE_BARRIERS_BOOL) {
       Return(TrueConstant());
       return;
     }
-    switch (rs_mode) {
-      case RememberedSetAction::kEmit:
-        GenerationalWriteBarrier(fp_mode);
-        break;
-      case RememberedSetAction::kOmit:
-        IncrementalWriteBarrier(fp_mode);
-        break;
+
+    WriteBarrier(fp_mode);
+    IncrementCounter(isolate()->counters()->write_barriers(), 1);
+    Return(TrueConstant());
+  }
+
+  void GenerateIndirectPointerBarrier(SaveFPRegsMode fp_mode) {
+    if (V8_DISABLE_WRITE_BARRIERS_BOOL) {
+      Return(TrueConstant());
+      return;
     }
+
+    if (!V8_ENABLE_SANDBOX_BOOL) {
+      Unreachable();
+      return;
+    }
+
+    IndirectPointerWriteBarrier(fp_mode);
     IncrementCounter(isolate()->counters()->write_barriers(), 1);
     Return(TrueConstant());
   }
@@ -369,7 +572,7 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
     TNode<ExternalReference> function = ExternalConstant(
         ExternalReference::ephemeron_key_write_barrier_function());
     TNode<ExternalReference> isolate_constant =
-        ExternalConstant(ExternalReference::isolate_address(isolate()));
+        ExternalConstant(ExternalReference::isolate_address());
     // In this method we limit the allocatable registers so we have to use
     // UncheckedParameter. Parameter does not work because the checked cast
     // needs more registers.
@@ -390,22 +593,20 @@ class WriteBarrierCodeStubAssembler : public CodeStubAssembler {
   }
 };
 
-TF_BUILTIN(RecordWriteEmitRememberedSetSaveFP, WriteBarrierCodeStubAssembler) {
-  GenerateRecordWrite(RememberedSetAction::kEmit, SaveFPRegsMode::kSave);
+TF_BUILTIN(RecordWriteSaveFP, WriteBarrierCodeStubAssembler) {
+  GenerateRecordWrite(SaveFPRegsMode::kSave);
 }
 
-TF_BUILTIN(RecordWriteOmitRememberedSetSaveFP, WriteBarrierCodeStubAssembler) {
-  GenerateRecordWrite(RememberedSetAction::kOmit, SaveFPRegsMode::kSave);
+TF_BUILTIN(RecordWriteIgnoreFP, WriteBarrierCodeStubAssembler) {
+  GenerateRecordWrite(SaveFPRegsMode::kIgnore);
 }
 
-TF_BUILTIN(RecordWriteEmitRememberedSetIgnoreFP,
-           WriteBarrierCodeStubAssembler) {
-  GenerateRecordWrite(RememberedSetAction::kEmit, SaveFPRegsMode::kIgnore);
+TF_BUILTIN(IndirectPointerBarrierSaveFP, WriteBarrierCodeStubAssembler) {
+  GenerateIndirectPointerBarrier(SaveFPRegsMode::kSave);
 }
 
-TF_BUILTIN(RecordWriteOmitRememberedSetIgnoreFP,
-           WriteBarrierCodeStubAssembler) {
-  GenerateRecordWrite(RememberedSetAction::kOmit, SaveFPRegsMode::kIgnore);
+TF_BUILTIN(IndirectPointerBarrierIgnoreFP, WriteBarrierCodeStubAssembler) {
+  GenerateIndirectPointerBarrier(SaveFPRegsMode::kIgnore);
 }
 
 TF_BUILTIN(EphemeronKeyBarrierSaveFP, WriteBarrierCodeStubAssembler) {
@@ -605,7 +806,7 @@ class DeletePropertyBaseAssembler : public AccessorAssembler {
                                 TNode<IntPtrT> key_index,
                                 TNode<Context> context) {
     // Overwrite the entry itself (see NameDictionary::SetEntry).
-    TNode<Oddball> filler = TheHoleConstant();
+    TNode<Hole> filler = TheHoleConstant();
     DCHECK(RootsTable::IsImmortalImmovable(RootIndex::kTheHoleValue));
     StoreFixedArrayElement(properties, key_index, filler, SKIP_WRITE_BARRIER);
     StoreValueByKeyIndex<NameDictionary>(properties, key_index, filler,
@@ -724,7 +925,7 @@ TF_BUILTIN(DeleteProperty, DeletePropertyBaseAssembler) {
 
     BIND(&dont_delete);
     {
-      STATIC_ASSERT(LanguageModeSize == 2);
+      static_assert(LanguageModeSize == 2);
       GotoIf(SmiNotEqual(language_mode, SmiConstant(LanguageMode::kSloppy)),
              &slow);
       Return(FalseConstant());
@@ -777,8 +978,8 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
   TNode<Object> SetOrCopyDataProperties(
       TNode<Context> context, TNode<JSReceiver> target, TNode<Object> source,
       Label* if_runtime,
-      base::Optional<TNode<IntPtrT>> excluded_property_count = base::nullopt,
-      base::Optional<TNode<IntPtrT>> excluded_property_base = base::nullopt,
+      std::optional<TNode<IntPtrT>> excluded_property_count = std::nullopt,
+      std::optional<TNode<IntPtrT>> excluded_property_base = std::nullopt,
       bool use_set = true) {
     Label if_done(this), if_noelements(this),
         if_sourcenotjsobject(this, Label::kDeferred);
@@ -812,16 +1013,16 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
         TNode<BoolT> target_is_simple_receiver = IsSimpleObjectMap(target_map);
         ForEachEnumerableOwnProperty(
             context, source_map, CAST(source), kEnumerationOrder,
-            [=](TNode<Name> key, TNode<Object> value) {
+            [=, this](TNode<Name> key, LazyNode<Object> value) {
               KeyedStoreGenericGenerator::SetProperty(
                   state(), context, target, target_is_simple_receiver, key,
-                  value, LanguageMode::kStrict);
+                  value(), LanguageMode::kStrict);
             },
             if_runtime);
       } else {
         ForEachEnumerableOwnProperty(
             context, source_map, CAST(source), kEnumerationOrder,
-            [=](TNode<Name> key, TNode<Object> value) {
+            [=, this](TNode<Name> key, LazyNode<Object> value) {
               Label skip(this);
               if (excluded_property_count.has_value()) {
                 BuildFastLoop<IntPtrT>(
@@ -836,11 +1037,11 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
                       BranchIfSameValue(key, property, &skip, &continue_label);
                       Bind(&continue_label);
                     },
-                    1, IndexAdvanceMode::kPost);
+                    1, LoopUnrollingMode::kNo, IndexAdvanceMode::kPost);
               }
 
               CallBuiltin(Builtin::kCreateDataProperty, context, target, key,
-                          value);
+                          value());
               Goto(&skip);
               Bind(&skip);
             },
@@ -857,8 +1058,8 @@ class SetOrCopyDataPropertiesAssembler : public CodeStubAssembler {
       // Non-empty strings are the only non-JSReceivers that need to be
       // handled explicitly by Object.assign() and CopyDataProperties.
       GotoIfNot(IsStringInstanceType(source_instance_type), &if_done);
-      TNode<IntPtrT> source_length = LoadStringLengthAsWord(CAST(source));
-      Branch(IntPtrEqual(source_length, IntPtrConstant(0)), &if_done,
+      TNode<Uint32T> source_length = LoadStringLengthAsWord32(CAST(source));
+      Branch(Word32Equal(source_length, Uint32Constant(0)), &if_done,
              if_runtime);
     }
 
@@ -928,8 +1129,8 @@ TF_BUILTIN(CopyDataProperties, SetOrCopyDataPropertiesAssembler) {
   CSA_DCHECK(this, TaggedNotEqual(target, source));
 
   Label if_runtime(this, Label::kDeferred);
-  SetOrCopyDataProperties(context, target, source, &if_runtime, base::nullopt,
-                          base::nullopt, false);
+  SetOrCopyDataProperties(context, target, source, &if_runtime, std::nullopt,
+                          std::nullopt, false);
   Return(UndefinedConstant());
 
   BIND(&if_runtime);
@@ -943,8 +1144,8 @@ TF_BUILTIN(SetDataProperties, SetOrCopyDataPropertiesAssembler) {
 
   Label if_runtime(this, Label::kDeferred);
   GotoIfForceSlowPath(&if_runtime);
-  SetOrCopyDataProperties(context, target, source, &if_runtime, base::nullopt,
-                          base::nullopt, true);
+  SetOrCopyDataProperties(context, target, source, &if_runtime, std::nullopt,
+                          std::nullopt, true);
   Return(UndefinedConstant());
 
   BIND(&if_runtime);
@@ -1072,19 +1273,23 @@ TF_BUILTIN(AdaptorWithBuiltinExitFrame, CodeStubAssembler) {
       Int32Constant(BuiltinExitFrameConstants::kNumExtraArgsWithoutReceiver));
 
   const bool builtin_exit_frame = true;
-  TNode<CodeT> code =
-      HeapConstant(CodeFactory::CEntry(isolate(), 1, SaveFPRegsMode::kIgnore,
-                                       ArgvMode::kStack, builtin_exit_frame));
+  const bool switch_to_central_stack = false;
+  Builtin centry = Builtins::CEntry(1, ArgvMode::kStack, builtin_exit_frame,
+                                    switch_to_central_stack);
 
   // Unconditionally push argc, target and new target as extra stack arguments.
   // They will be used by stack frame iterators when constructing stack trace.
-  TailCallStub(CEntry1ArgvOnStackDescriptor{},  // descriptor
-               code, context,       // standard arguments for TailCallStub
-               argc, c_function,    // register arguments
-               TheHoleConstant(),   // additional stack argument 1 (padding)
-               SmiFromInt32(argc),  // additional stack argument 2
-               target,              // additional stack argument 3
-               new_target);         // additional stack argument 4
+  TailCallBuiltin(centry, context,     // standard arguments for TailCallBuiltin
+                  argc, c_function,    // register arguments
+                  TheHoleConstant(),   // additional stack argument 1 (padding)
+                  SmiFromInt32(argc),  // additional stack argument 2
+                  target,              // additional stack argument 3
+                  new_target);         // additional stack argument 4
+}
+
+TF_BUILTIN(NewHeapNumber, CodeStubAssembler) {
+  auto val = UncheckedParameter<Float64T>(Descriptor::kValue);
+  Return(ChangeFloat64ToTagged(val));
 }
 
 TF_BUILTIN(AllocateInYoungGeneration, CodeStubAssembler) {
@@ -1092,19 +1297,7 @@ TF_BUILTIN(AllocateInYoungGeneration, CodeStubAssembler) {
   CSA_CHECK(this, IsValidPositiveSmi(requested_size));
 
   TNode<Smi> allocation_flags =
-      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false) |
-                               AllowLargeObjectAllocationFlag::encode(true)));
-  TailCallRuntime(Runtime::kAllocateInYoungGeneration, NoContextConstant(),
-                  SmiFromIntPtr(requested_size), allocation_flags);
-}
-
-TF_BUILTIN(AllocateRegularInYoungGeneration, CodeStubAssembler) {
-  auto requested_size = UncheckedParameter<IntPtrT>(Descriptor::kRequestedSize);
-  CSA_CHECK(this, IsValidPositiveSmi(requested_size));
-
-  TNode<Smi> allocation_flags =
-      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false) |
-                               AllowLargeObjectAllocationFlag::encode(false)));
+      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false)));
   TailCallRuntime(Runtime::kAllocateInYoungGeneration, NoContextConstant(),
                   SmiFromIntPtr(requested_size), allocation_flags);
 }
@@ -1114,22 +1307,32 @@ TF_BUILTIN(AllocateInOldGeneration, CodeStubAssembler) {
   CSA_CHECK(this, IsValidPositiveSmi(requested_size));
 
   TNode<Smi> runtime_flags =
-      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false) |
-                               AllowLargeObjectAllocationFlag::encode(true)));
+      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false)));
   TailCallRuntime(Runtime::kAllocateInOldGeneration, NoContextConstant(),
                   SmiFromIntPtr(requested_size), runtime_flags);
 }
 
-TF_BUILTIN(AllocateRegularInOldGeneration, CodeStubAssembler) {
+#if V8_ENABLE_WEBASSEMBLY
+TF_BUILTIN(WasmAllocateInYoungGeneration, CodeStubAssembler) {
+  auto requested_size = UncheckedParameter<IntPtrT>(Descriptor::kRequestedSize);
+  CSA_CHECK(this, IsValidPositiveSmi(requested_size));
+
+  TNode<Smi> allocation_flags =
+      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false)));
+  TailCallRuntime(Runtime::kAllocateInYoungGeneration, NoContextConstant(),
+                  SmiFromIntPtr(requested_size), allocation_flags);
+}
+
+TF_BUILTIN(WasmAllocateInOldGeneration, CodeStubAssembler) {
   auto requested_size = UncheckedParameter<IntPtrT>(Descriptor::kRequestedSize);
   CSA_CHECK(this, IsValidPositiveSmi(requested_size));
 
   TNode<Smi> runtime_flags =
-      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false) |
-                               AllowLargeObjectAllocationFlag::encode(false)));
+      SmiConstant(Smi::FromInt(AllocateDoubleAlignFlag::encode(false)));
   TailCallRuntime(Runtime::kAllocateInOldGeneration, NoContextConstant(),
                   SmiFromIntPtr(requested_size), runtime_flags);
 }
+#endif
 
 TF_BUILTIN(Abort, CodeStubAssembler) {
   auto message_id = Parameter<Smi>(Descriptor::kMessageOrMessageId);
@@ -1141,88 +1344,103 @@ TF_BUILTIN(AbortCSADcheck, CodeStubAssembler) {
   TailCallRuntime(Runtime::kAbortCSADcheck, NoContextConstant(), message);
 }
 
-void Builtins::Generate_CEntry_Return1_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit(
+void Builtins::Generate_CEntry_Return1_ArgvOnStack_NoBuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 1, SaveFPRegsMode::kIgnore, ArgvMode::kStack, false);
+  Generate_CEntry(masm, 1, ArgvMode::kStack, false, false);
 }
 
-void Builtins::Generate_CEntry_Return1_DontSaveFPRegs_ArgvOnStack_BuiltinExit(
+void Builtins::Generate_CEntry_Return1_ArgvOnStack_BuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 1, SaveFPRegsMode::kIgnore, ArgvMode::kStack, true);
+  Generate_CEntry(masm, 1, ArgvMode::kStack, true, false);
 }
 
-void Builtins::
-    Generate_CEntry_Return1_DontSaveFPRegs_ArgvInRegister_NoBuiltinExit(
-        MacroAssembler* masm) {
-  Generate_CEntry(masm, 1, SaveFPRegsMode::kIgnore, ArgvMode::kRegister, false);
-}
-
-void Builtins::Generate_CEntry_Return1_SaveFPRegs_ArgvOnStack_NoBuiltinExit(
+void Builtins::Generate_CEntry_Return1_ArgvInRegister_NoBuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 1, SaveFPRegsMode::kSave, ArgvMode::kStack, false);
+  Generate_CEntry(masm, 1, ArgvMode::kRegister, false, false);
 }
 
-void Builtins::Generate_CEntry_Return1_SaveFPRegs_ArgvOnStack_BuiltinExit(
+void Builtins::Generate_CEntry_Return2_ArgvOnStack_NoBuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 1, SaveFPRegsMode::kSave, ArgvMode::kStack, true);
+  Generate_CEntry(masm, 2, ArgvMode::kStack, false, false);
 }
 
-void Builtins::Generate_CEntry_Return2_DontSaveFPRegs_ArgvOnStack_NoBuiltinExit(
+void Builtins::Generate_CEntry_Return2_ArgvOnStack_BuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 2, SaveFPRegsMode::kIgnore, ArgvMode::kStack, false);
+  Generate_CEntry(masm, 2, ArgvMode::kStack, true, false);
 }
 
-void Builtins::Generate_CEntry_Return2_DontSaveFPRegs_ArgvOnStack_BuiltinExit(
+void Builtins::Generate_CEntry_Return2_ArgvInRegister_NoBuiltinExit(
     MacroAssembler* masm) {
-  Generate_CEntry(masm, 2, SaveFPRegsMode::kIgnore, ArgvMode::kStack, true);
+  Generate_CEntry(masm, 2, ArgvMode::kRegister, false, false);
 }
 
-void Builtins::
-    Generate_CEntry_Return2_DontSaveFPRegs_ArgvInRegister_NoBuiltinExit(
-        MacroAssembler* masm) {
-  Generate_CEntry(masm, 2, SaveFPRegsMode::kIgnore, ArgvMode::kRegister, false);
+void Builtins::Generate_WasmCEntry(MacroAssembler* masm) {
+  Generate_CEntry(masm, 1, ArgvMode::kStack, false, true);
 }
 
-void Builtins::Generate_CEntry_Return2_SaveFPRegs_ArgvOnStack_NoBuiltinExit(
-    MacroAssembler* masm) {
-  Generate_CEntry(masm, 2, SaveFPRegsMode::kSave, ArgvMode::kStack, false);
-}
-
-void Builtins::Generate_CEntry_Return2_SaveFPRegs_ArgvOnStack_BuiltinExit(
-    MacroAssembler* masm) {
-  Generate_CEntry(masm, 2, SaveFPRegsMode::kSave, ArgvMode::kStack, true);
-}
-
-#if !defined(V8_TARGET_ARCH_ARM) && !defined(V8_TARGET_ARCH_MIPS)
+#if !defined(V8_TARGET_ARCH_ARM)
 void Builtins::Generate_MemCopyUint8Uint8(MacroAssembler* masm) {
-  masm->Call(BUILTIN_CODE(masm->isolate(), Illegal), RelocInfo::CODE_TARGET);
+  masm->CallBuiltin(Builtin::kIllegal);
 }
-#endif  // !defined(V8_TARGET_ARCH_ARM) && !defined(V8_TARGET_ARCH_MIPS)
+#endif  // !defined(V8_TARGET_ARCH_ARM)
 
 #ifndef V8_TARGET_ARCH_IA32
 void Builtins::Generate_MemMove(MacroAssembler* masm) {
-  masm->Call(BUILTIN_CODE(masm->isolate(), Illegal), RelocInfo::CODE_TARGET);
+  masm->CallBuiltin(Builtin::kIllegal);
 }
 #endif  // V8_TARGET_ARCH_IA32
 
-// TODO(v8:11421): Remove #if once baseline compiler is ported to other
-// architectures.
-#if ENABLE_SPARKPLUG
 void Builtins::Generate_BaselineLeaveFrame(MacroAssembler* masm) {
+#ifdef V8_ENABLE_SPARKPLUG
   EmitReturnBaseline(masm);
+#else
+  masm->Trap();
+#endif  // V8_ENABLE_SPARKPLUG
+}
+
+// TODO(v8:11421): Remove #if once the Maglev compiler is ported to other
+// architectures.
+#ifndef V8_TARGET_ARCH_X64
+void Builtins::Generate_MaglevOnStackReplacement(MacroAssembler* masm) {
+  using D =
+      i::CallInterfaceDescriptorFor<Builtin::kMaglevOnStackReplacement>::type;
+  static_assert(D::kParameterCount == 1);
+  masm->Trap();
+}
+#endif  // V8_TARGET_ARCH_X64
+
+#ifdef V8_ENABLE_MAGLEV
+void Builtins::Generate_MaglevOptimizeCodeOrTailCallOptimizedCodeSlot(
+    MacroAssembler* masm) {
+  using D = MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor;
+  Register flags = D::GetRegisterParameter(D::kFlags);
+  Register feedback_vector = D::GetRegisterParameter(D::kFeedbackVector);
+  Register temporary = D::GetRegisterParameter(D::kTemporary);
+  masm->AssertFeedbackVector(feedback_vector, temporary);
+  masm->OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
+  masm->Trap();
 }
 #else
-// Stub out implementations of arch-specific baseline builtins.
-void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
+// static
+void Builtins::Generate_MaglevFunctionEntryStackCheck(MacroAssembler* masm,
+                                                      bool save_new_target) {
   masm->Trap();
 }
-void Builtins::Generate_BaselineLeaveFrame(MacroAssembler* masm) {
+void Builtins::Generate_MaglevOptimizeCodeOrTailCallOptimizedCodeSlot(
+    MacroAssembler* masm) {
   masm->Trap();
 }
-void Builtins::Generate_BaselineOnStackReplacement(MacroAssembler* masm) {
-  masm->Trap();
+#endif  // V8_ENABLE_MAGLEV
+
+void Builtins::Generate_MaglevFunctionEntryStackCheck_WithoutNewTarget(
+    MacroAssembler* masm) {
+  Generate_MaglevFunctionEntryStackCheck(masm, false);
 }
-#endif
+
+void Builtins::Generate_MaglevFunctionEntryStackCheck_WithNewTarget(
+    MacroAssembler* masm) {
+  Generate_MaglevFunctionEntryStackCheck(masm, true);
+}
 
 // ES6 [[Get]] operation.
 TF_BUILTIN(GetProperty, CodeStubAssembler) {
@@ -1235,22 +1453,26 @@ TF_BUILTIN(GetProperty, CodeStubAssembler) {
       if_slow(this, Label::kDeferred);
 
   CodeStubAssembler::LookupPropertyInHolder lookup_property_in_holder =
-      [=](TNode<HeapObject> receiver, TNode<HeapObject> holder,
-          TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
-          TNode<Name> unique_name, Label* next_holder, Label* if_bailout) {
+      [=, this](TNode<HeapObject> receiver, TNode<HeapObject> holder,
+                TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
+                TNode<Name> unique_name, Label* next_holder,
+                Label* if_bailout) {
         TVARIABLE(Object, var_value);
         Label if_found(this);
+        // If we get here then it's guaranteed that |object| (and thus the
+        // |receiver|) is a JSReceiver.
         TryGetOwnProperty(context, receiver, CAST(holder), holder_map,
                           holder_instance_type, unique_name, &if_found,
-                          &var_value, next_holder, if_bailout);
+                          &var_value, next_holder, if_bailout,
+                          kExpectingJSReceiver);
         BIND(&if_found);
         Return(var_value.value());
       };
 
   CodeStubAssembler::LookupElementInHolder lookup_element_in_holder =
-      [=](TNode<HeapObject> receiver, TNode<HeapObject> holder,
-          TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
-          TNode<IntPtrT> index, Label* next_holder, Label* if_bailout) {
+      [=, this](TNode<HeapObject> receiver, TNode<HeapObject> holder,
+                TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
+                TNode<IntPtrT> index, Label* next_holder, Label* if_bailout) {
         // Not supported yet.
         Use(next_holder);
         Goto(if_bailout);
@@ -1290,22 +1512,24 @@ TF_BUILTIN(GetPropertyWithReceiver, CodeStubAssembler) {
       if_slow(this, Label::kDeferred);
 
   CodeStubAssembler::LookupPropertyInHolder lookup_property_in_holder =
-      [=](TNode<HeapObject> receiver, TNode<HeapObject> holder,
-          TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
-          TNode<Name> unique_name, Label* next_holder, Label* if_bailout) {
+      [=, this](TNode<HeapObject> receiver, TNode<HeapObject> holder,
+                TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
+                TNode<Name> unique_name, Label* next_holder,
+                Label* if_bailout) {
         TVARIABLE(Object, var_value);
         Label if_found(this);
         TryGetOwnProperty(context, receiver, CAST(holder), holder_map,
                           holder_instance_type, unique_name, &if_found,
-                          &var_value, next_holder, if_bailout);
+                          &var_value, next_holder, if_bailout,
+                          kExpectingAnyReceiver);
         BIND(&if_found);
         Return(var_value.value());
       };
 
   CodeStubAssembler::LookupElementInHolder lookup_element_in_holder =
-      [=](TNode<HeapObject> receiver, TNode<HeapObject> holder,
-          TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
-          TNode<IntPtrT> index, Label* next_holder, Label* if_bailout) {
+      [=, this](TNode<HeapObject> receiver, TNode<HeapObject> holder,
+                TNode<Map> holder_map, TNode<Int32T> holder_instance_type,
+                TNode<IntPtrT> index, Label* next_holder, Label* if_bailout) {
         // Not supported yet.
         Use(next_holder);
         Goto(if_bailout);
@@ -1411,9 +1635,60 @@ TF_BUILTIN(InstantiateAsmJs, CodeStubAssembler) {
   // On failure, tail call back to regular JavaScript by re-calling the given
   // function which has been reset to the compile lazy builtin.
 
-  TNode<CodeT> code = LoadJSFunctionCode(function);
+  TNode<Code> code = LoadJSFunctionCode(function);
   TailCallJSCode(code, context, function, new_target, arg_count);
 }
+
+TF_BUILTIN(FindNonDefaultConstructorOrConstruct, CodeStubAssembler) {
+  auto this_function = Parameter<JSFunction>(Descriptor::kThisFunction);
+  auto new_target = Parameter<Object>(Descriptor::kNewTarget);
+  auto context = Parameter<Context>(Descriptor::kContext);
+
+  TVARIABLE(Object, constructor);
+  Label found_default_base_ctor(this, &constructor),
+      found_something_else(this, &constructor);
+
+  FindNonDefaultConstructor(this_function, constructor,
+                            &found_default_base_ctor, &found_something_else);
+
+  BIND(&found_default_base_ctor);
+  {
+    // Create an object directly, without calling the default base ctor.
+    TNode<Object> instance = CallBuiltin(Builtin::kFastNewObject, context,
+                                         constructor.value(), new_target);
+    Return(TrueConstant(), instance);
+  }
+
+  BIND(&found_something_else);
+  {
+    // Not a base ctor (or bailed out).
+    Return(FalseConstant(), constructor.value());
+  }
+}
+
+// Dispatcher for different implementations of the [[GetOwnProperty]] internal
+// method, returning a PropertyDescriptorObject (a Struct representation of the
+// spec PropertyDescriptor concept)
+TF_BUILTIN(GetOwnPropertyDescriptor, CodeStubAssembler) {
+  auto context = Parameter<Context>(Descriptor::kContext);
+  auto receiver = Parameter<JSReceiver>(Descriptor::kReceiver);
+  auto key = Parameter<Name>(Descriptor::kKey);
+
+  Label call_runtime(this);
+
+  TNode<Map> map = LoadMap(receiver);
+  TNode<Uint16T> instance_type = LoadMapInstanceType(map);
+
+  GotoIf(IsSpecialReceiverInstanceType(instance_type), &call_runtime);
+  TailCallBuiltin(Builtin::kOrdinaryGetOwnPropertyDescriptor, context, receiver,
+                  key);
+
+  BIND(&call_runtime);
+  TailCallRuntime(Runtime::kGetOwnPropertyDescriptorObject, context, receiver,
+                  key);
+}
+
+#include "src/codegen/undef-code-stub-assembler-macros.inc"
 
 }  // namespace internal
 }  // namespace v8

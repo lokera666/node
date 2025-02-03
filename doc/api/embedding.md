@@ -23,7 +23,7 @@ a Node.js-specific environment.
 
 The full code can be found [in the Node.js source tree][embedtest.cc].
 
-### Setting up per-process state
+### Setting up a per-process state
 
 Node.js requires some per-process state management in order to run:
 
@@ -37,15 +37,18 @@ the `node` and `v8` C++ namespaces, respectively.
 int main(int argc, char** argv) {
   argv = uv_setup_args(argc, argv);
   std::vector<std::string> args(argv, argv + argc);
-  std::vector<std::string> exec_args;
-  std::vector<std::string> errors;
   // Parse Node.js CLI options, and print any errors that have occurred while
   // trying to parse them.
-  int exit_code = node::InitializeNodeWithArgs(&args, &exec_args, &errors);
-  for (const std::string& error : errors)
+  std::unique_ptr<node::InitializationResult> result =
+      node::InitializeOncePerProcess(args, {
+        node::ProcessInitializationFlags::kNoInitializeV8,
+        node::ProcessInitializationFlags::kNoInitializeNodeV8Platform
+      });
+
+  for (const std::string& error : result->errors())
     fprintf(stderr, "%s: %s\n", args[0].c_str(), error.c_str());
-  if (exit_code != 0) {
-    return exit_code;
+  if (result->early_return() != 0) {
+    return result->exit_code();
   }
 
   // Create a v8::Platform instance. `MultiIsolatePlatform::Create()` is a way
@@ -58,15 +61,18 @@ int main(int argc, char** argv) {
   V8::Initialize();
 
   // See below for the contents of this function.
-  int ret = RunNodeInstance(platform.get(), args, exec_args);
+  int ret = RunNodeInstance(
+      platform.get(), result->args(), result->exec_args());
 
   V8::Dispose();
   V8::DisposePlatform();
+
+  node::TearDownOncePerProcess();
   return ret;
 }
 ```
 
-### Per-instance state
+### Setting up a per-instance state
 
 <!-- YAML
 changes:
@@ -80,11 +86,12 @@ Node.js has a concept of a “Node.js instance”, that is commonly being referr
 to as `node::Environment`. Each `node::Environment` is associated with:
 
 * Exactly one `v8::Isolate`, i.e. one JS Engine instance,
-* Exactly one `uv_loop_t`, i.e. one event loop, and
-* A number of `v8::Context`s, but exactly one main `v8::Context`.
+* Exactly one `uv_loop_t`, i.e. one event loop,
+* A number of `v8::Context`s, but exactly one main `v8::Context`, and
 * One `node::IsolateData` instance that contains information that could be
-  shared by multiple `node::Environment`s that use the same `v8::Isolate`.
-  Currently, no testing if performed for this scenario.
+  shared by multiple `node::Environment`s. The embedder should make sure
+  that `node::IsolateData` is shared only among `node::Environment`s that
+  use the same `v8::Isolate`, Node.js does not perform this check.
 
 In order to set up a `v8::Isolate`, an `v8::ArrayBuffer::Allocator` needs
 to be provided. One possible choice is the default Node.js allocator, which

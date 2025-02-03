@@ -22,18 +22,24 @@
 #include "node_buffer.h"
 #include "node.h"
 #include "node_blob.h"
+#include "node_debug.h"
 #include "node_errors.h"
 #include "node_external_reference.h"
+#include "node_i18n.h"
 #include "node_internals.h"
 
 #include "env-inl.h"
+#include "simdutf.h"
 #include "string_bytes.h"
-#include "string_search.h"
+
 #include "util-inl.h"
+#include "v8-fast-api-calls.h"
 #include "v8.h"
 
-#include <cstring>
+#include <stdint.h>
 #include <climits>
+#include <cstring>
+#include "nbytes.h"
 
 #define THROW_AND_RETURN_UNLESS_BUFFER(env, obj)                            \
   THROW_AND_RETURN_IF_NOT_BUFFER(env, obj, "argument")                      \
@@ -52,8 +58,10 @@ namespace Buffer {
 using v8::ArrayBuffer;
 using v8::ArrayBufferView;
 using v8::BackingStore;
+using v8::BackingStoreInitializationMode;
 using v8::Context;
 using v8::EscapableHandleScope;
+using v8::FastApiTypedArray;
 using v8::FunctionCallbackInfo;
 using v8::Global;
 using v8::HandleScope;
@@ -64,6 +72,7 @@ using v8::Just;
 using v8::Local;
 using v8::Maybe;
 using v8::MaybeLocal;
+using v8::NewStringType;
 using v8::Nothing;
 using v8::Number;
 using v8::Object;
@@ -76,7 +85,7 @@ using v8::Value;
 
 namespace {
 
-class CallbackInfo {
+class CallbackInfo : public Cleanable {
  public:
   static inline Local<ArrayBuffer> CreateTrackedArrayBuffer(
       Environment* env,
@@ -89,7 +98,7 @@ class CallbackInfo {
   CallbackInfo& operator=(const CallbackInfo&) = delete;
 
  private:
-  static void CleanupHook(void* data);
+  void Clean();
   inline void OnBackingStoreFree();
   inline void CallAndResetCallback();
   inline CallbackInfo(Environment* env,
@@ -103,7 +112,6 @@ class CallbackInfo {
   void* const hint_;
   Environment* const env_;
 };
-
 
 Local<ArrayBuffer> CallbackInfo::CreateTrackedArrayBuffer(
     Environment* env,
@@ -124,7 +132,7 @@ Local<ArrayBuffer> CallbackInfo::CreateTrackedArrayBuffer(
   // V8 simply ignores the BackingStore deleter callback if data == nullptr,
   // but our API contract requires it being called.
   if (data == nullptr) {
-    ab->Detach();
+    ab->Detach(Local<Value>()).Check();
     self->OnBackingStoreFree();  // This calls `callback` asynchronously.
   } else {
     // Store the ArrayBuffer so that we can detach it later.
@@ -144,25 +152,23 @@ CallbackInfo::CallbackInfo(Environment* env,
       data_(data),
       hint_(hint),
       env_(env) {
-  env->AddCleanupHook(CleanupHook, this);
+  env->cleanable_queue()->PushFront(this);
   env->isolate()->AdjustAmountOfExternalAllocatedMemory(sizeof(*this));
 }
 
-void CallbackInfo::CleanupHook(void* data) {
-  CallbackInfo* self = static_cast<CallbackInfo*>(data);
-
+void CallbackInfo::Clean() {
   {
-    HandleScope handle_scope(self->env_->isolate());
-    Local<ArrayBuffer> ab = self->persistent_.Get(self->env_->isolate());
+    HandleScope handle_scope(env_->isolate());
+    Local<ArrayBuffer> ab = persistent_.Get(env_->isolate());
     if (!ab.IsEmpty() && ab->IsDetachable()) {
-      ab->Detach();
-      self->persistent_.Reset();
+      ab->Detach(Local<Value>()).Check();
+      persistent_.Reset();
     }
   }
 
   // Call the callback in this case, but don't delete `this` yet because the
   // BackingStore deleter callback will do so later.
-  self->CallAndResetCallback();
+  CallAndResetCallback();
 }
 
 void CallbackInfo::CallAndResetCallback() {
@@ -174,7 +180,7 @@ void CallbackInfo::CallAndResetCallback() {
   }
   if (callback != nullptr) {
     // Clean up all Environment-related state and run the callback.
-    env_->RemoveCleanupHook(CleanupHook, this);
+    cleanable_queue_.Remove();
     int64_t change_in_bytes = -static_cast<int64_t>(sizeof(*this));
     env_->isolate()->AdjustAmountOfExternalAllocatedMemory(change_in_bytes);
 
@@ -244,8 +250,7 @@ bool HasInstance(Local<Object> obj) {
 char* Data(Local<Value> val) {
   CHECK(val->IsArrayBufferView());
   Local<ArrayBufferView> ui = val.As<ArrayBufferView>();
-  return static_cast<char*>(ui->Buffer()->GetBackingStore()->Data()) +
-      ui->ByteOffset();
+  return static_cast<char*>(ui->Buffer()->Data()) + ui->ByteOffset();
 }
 
 
@@ -275,7 +280,7 @@ MaybeLocal<Uint8Array> New(Environment* env,
   CHECK(!env->buffer_prototype_object().IsEmpty());
   Local<Uint8Array> ui = Uint8Array::New(ab, byte_offset, length);
   Maybe<bool> mb =
-      ui->SetPrototype(env->context(), env->buffer_prototype_object());
+      ui->SetPrototypeV2(env->context(), env->buffer_prototype_object());
   if (mb.IsNothing())
     return MaybeLocal<Uint8Array>();
   return ui;
@@ -308,7 +313,7 @@ MaybeLocal<Object> New(Isolate* isolate,
   if (length > 0) {
     store = ArrayBuffer::NewBackingStore(isolate, length);
 
-    if (UNLIKELY(!store)) {
+    if (!store) [[unlikely]] {
       THROW_ERR_MEMORY_ALLOCATION_FAILED(isolate);
       return Local<Object>();
     }
@@ -321,13 +326,19 @@ MaybeLocal<Object> New(Isolate* isolate,
         enc);
     CHECK(actual <= length);
 
-    if (LIKELY(actual > 0)) {
-      if (actual < length)
-        store = BackingStore::Reallocate(isolate, std::move(store), actual);
+    if (actual > 0) [[likely]] {
+      if (actual < length) {
+        std::unique_ptr<BackingStore> old_store = std::move(store);
+        store = ArrayBuffer::NewBackingStore(isolate, actual);
+        memcpy(static_cast<char*>(store->Data()),
+               static_cast<char*>(old_store->Data()),
+               actual);
+      }
       Local<ArrayBuffer> buf = ArrayBuffer::New(isolate, std::move(store));
       Local<Object> obj;
-      if (UNLIKELY(!New(isolate, buf, 0, actual).ToLocal(&obj)))
-        return MaybeLocal<Object>();
+      if (!New(isolate, buf, 0, actual).ToLocal(&obj)) [[unlikely]] {
+        return {};
+      }
       return scope.Escape(obj);
     }
   }
@@ -362,9 +373,8 @@ MaybeLocal<Object> New(Environment* env, size_t length) {
 
   Local<ArrayBuffer> ab;
   {
-    NoArrayBufferZeroFillScope no_zero_fill_scope(env->isolate_data());
-    std::unique_ptr<BackingStore> bs =
-        ArrayBuffer::NewBackingStore(isolate, length);
+    std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
+        isolate, length, BackingStoreInitializationMode::kUninitialized);
 
     CHECK(bs);
 
@@ -403,18 +413,14 @@ MaybeLocal<Object> Copy(Environment* env, const char* data, size_t length) {
     return Local<Object>();
   }
 
-  Local<ArrayBuffer> ab;
-  {
-    NoArrayBufferZeroFillScope no_zero_fill_scope(env->isolate_data());
-    std::unique_ptr<BackingStore> bs =
-        ArrayBuffer::NewBackingStore(isolate, length);
+  std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
+      isolate, length, BackingStoreInitializationMode::kUninitialized);
 
-    CHECK(bs);
+  CHECK(bs);
 
-    memcpy(bs->Data(), data, length);
+  memcpy(bs->Data(), data, length);
 
-    ab = ArrayBuffer::New(isolate, std::move(bs));
-  }
+  Local<ArrayBuffer> ab = ArrayBuffer::New(isolate, std::move(bs));
 
   MaybeLocal<Object> obj =
       New(env, ab, 0, ab->ByteLength())
@@ -520,17 +526,6 @@ MaybeLocal<Object> New(Environment* env,
 
 namespace {
 
-void CreateFromString(const FunctionCallbackInfo<Value>& args) {
-  CHECK(args[0]->IsString());
-  CHECK(args[1]->IsInt32());
-
-  enum encoding enc = static_cast<enum encoding>(args[1].As<Int32>()->Value());
-  Local<Object> buf;
-  if (New(args.GetIsolate(), args[0].As<String>(), enc).ToLocal(&buf))
-    args.GetReturnValue().Set(buf);
-}
-
-
 template <encoding encoding>
 void StringSlice(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
@@ -566,45 +561,40 @@ void StringSlice(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(ret);
 }
 
-
-// bytesCopied = copy(buffer, target[, targetStart][, sourceStart][, sourceEnd])
-void Copy(const FunctionCallbackInfo<Value> &args) {
+// Assume caller has properly validated args.
+void SlowCopy(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
-  THROW_AND_RETURN_UNLESS_BUFFER(env, args[1]);
   ArrayBufferViewContents<char> source(args[0]);
-  Local<Object> target_obj = args[1].As<Object>();
-  SPREAD_BUFFER_ARG(target_obj, target);
+  SPREAD_BUFFER_ARG(args[1].As<Object>(), target);
 
-  size_t target_start = 0;
-  size_t source_start = 0;
-  size_t source_end = 0;
-
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(env, args[2], 0, &target_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(env, args[3], 0, &source_start));
-  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(env, args[4], source.length(),
-                                          &source_end));
-
-  // Copy 0 bytes; we're done
-  if (target_start >= target_length || source_start >= source_end)
-    return args.GetReturnValue().Set(0);
-
-  if (source_start > source.length())
-    return THROW_ERR_OUT_OF_RANGE(
-        env, "The value of \"sourceStart\" is out of range.");
-
-  if (source_end - source_start > target_length - target_start)
-    source_end = source_start + target_length - target_start;
-
-  uint32_t to_copy = std::min(
-      std::min(source_end - source_start, target_length - target_start),
-      source.length() - source_start);
+  const auto target_start = args[2]->Uint32Value(env->context()).ToChecked();
+  const auto source_start = args[3]->Uint32Value(env->context()).ToChecked();
+  const auto to_copy = args[4]->Uint32Value(env->context()).ToChecked();
 
   memmove(target_data + target_start, source.data() + source_start, to_copy);
   args.GetReturnValue().Set(to_copy);
 }
 
+// Assume caller has properly validated args.
+uint32_t FastCopy(Local<Value> receiver,
+                  const v8::FastApiTypedArray<uint8_t>& source,
+                  const v8::FastApiTypedArray<uint8_t>& target,
+                  uint32_t target_start,
+                  uint32_t source_start,
+                  uint32_t to_copy) {
+  uint8_t* source_data;
+  CHECK(source.getStorageIfAligned(&source_data));
+
+  uint8_t* target_data;
+  CHECK(target.getStorageIfAligned(&target_data));
+
+  memmove(target_data + target_start, source_data + source_start, to_copy);
+
+  return to_copy;
+}
+
+static v8::CFunction fast_copy(v8::CFunction::Make(FastCopy));
 
 void Fill(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
@@ -658,8 +648,8 @@ void Fill(const FunctionCallbackInfo<Value>& args) {
   } else if (enc == UCS2) {
     str_length = str_obj->Length() * sizeof(uint16_t);
     node::TwoByteValue str(env->isolate(), args[1]);
-    if (IsBigEndian())
-      SwapBytes16(reinterpret_cast<char*>(&str[0]), str_length);
+    if constexpr (IsBigEndian())
+      CHECK(nbytes::SwapBytes16(reinterpret_cast<char*>(&str[0]), str_length));
 
     memcpy(ts_obj_data + start, *str, std::min(str_length, fill_length));
 
@@ -667,12 +657,8 @@ void Fill(const FunctionCallbackInfo<Value>& args) {
     // Write initial String to Buffer, then use that memory to copy remainder
     // of string. Correct the string length for cases like HEX where less than
     // the total string length is written.
-    str_length = StringBytes::Write(env->isolate(),
-                                    ts_obj_data + start,
-                                    fill_length,
-                                    str_obj,
-                                    enc,
-                                    nullptr);
+    str_length = StringBytes::Write(
+        env->isolate(), ts_obj_data + start, fill_length, str_obj, enc);
   }
 
 start_fill:
@@ -731,22 +717,64 @@ void StringWrite(const FunctionCallbackInfo<Value>& args) {
   if (max_length == 0)
     return args.GetReturnValue().Set(0);
 
-  uint32_t written = StringBytes::Write(env->isolate(),
-                                        ts_obj_data + offset,
-                                        max_length,
-                                        str,
-                                        encoding,
-                                        nullptr);
+  uint32_t written = StringBytes::Write(
+      env->isolate(), ts_obj_data + offset, max_length, str, encoding);
   args.GetReturnValue().Set(written);
 }
 
-void ByteLengthUtf8(const FunctionCallbackInfo<Value> &args) {
+void SlowByteLengthUtf8(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   CHECK(args[0]->IsString());
 
   // Fast case: avoid StringBytes on UTF8 string. Jump to v8.
   args.GetReturnValue().Set(args[0].As<String>()->Utf8Length(env->isolate()));
 }
+
+uint32_t FastByteLengthUtf8(Local<Value> receiver,
+                            const v8::FastOneByteString& source) {
+  // For short inputs, the function call overhead to simdutf is maybe
+  // not worth it, reserve simdutf for long strings.
+  if (source.length > 128) {
+    return simdutf::utf8_length_from_latin1(source.data, source.length);
+  }
+
+  uint32_t length = source.length;
+  const auto input = reinterpret_cast<const uint8_t*>(source.data);
+
+  uint32_t answer = length;
+  uint32_t i = 0;
+
+  auto pop = [](uint64_t v) {
+    return static_cast<size_t>(((v >> 7) & UINT64_C(0x0101010101010101)) *
+                                   UINT64_C(0x0101010101010101) >>
+                               56);
+  };
+
+  for (; i + 32 <= length; i += 32) {
+    uint64_t v;
+    memcpy(&v, input + i, 8);
+    answer += pop(v);
+    memcpy(&v, input + i + 8, 8);
+    answer += pop(v);
+    memcpy(&v, input + i + 16, 8);
+    answer += pop(v);
+    memcpy(&v, input + i + 24, 8);
+    answer += pop(v);
+  }
+  for (; i + 8 <= length; i += 8) {
+    uint64_t v;
+    memcpy(&v, input + i, 8);
+    answer += pop(v);
+  }
+  for (; i + 1 <= length; i += 1) {
+    answer += input[i] >> 7;
+  }
+
+  return answer;
+}
+
+static v8::CFunction fast_byte_length_utf8(
+    v8::CFunction::Make(FastByteLengthUtf8));
 
 // Normalize val to be an integer in the range of [1, -1] since
 // implementations of memcmp() can vary by platform.
@@ -825,6 +853,23 @@ void Compare(const FunctionCallbackInfo<Value> &args) {
   args.GetReturnValue().Set(val);
 }
 
+int32_t FastCompare(v8::Local<v8::Value>,
+                    const FastApiTypedArray<uint8_t>& a,
+                    const FastApiTypedArray<uint8_t>& b) {
+  uint8_t* data_a;
+  uint8_t* data_b;
+  CHECK(a.getStorageIfAligned(&data_a));
+  CHECK(b.getStorageIfAligned(&data_b));
+
+  size_t cmp_length = std::min(a.length(), b.length());
+
+  return normalizeCompareVal(
+      cmp_length > 0 ? memcmp(data_a, data_b, cmp_length) : 0,
+      a.length(),
+      b.length());
+}
+
+static v8::CFunction fast_compare(v8::CFunction::Make(FastCompare));
 
 // Computes the offset for starting an indexOf or lastIndexOf search.
 // Returns either a valid offset in [0...<length - 1>], ie inside the Buffer,
@@ -917,14 +962,15 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
 
   if (enc == UCS2) {
     String::Value needle_value(isolate, needle);
-    if (*needle_value == nullptr)
+    if (*needle_value == nullptr) {
       return args.GetReturnValue().Set(-1);
+    }
 
     if (haystack_length < 2 || needle_value.length() < 1) {
       return args.GetReturnValue().Set(-1);
     }
 
-    if (IsBigEndian()) {
+    if constexpr (IsBigEndian()) {
       StringBytes::InlineDecoder decoder;
       if (decoder.Decode(env, needle, enc).IsNothing()) return;
       const uint16_t* decoded_string =
@@ -933,19 +979,20 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
       if (decoded_string == nullptr)
         return args.GetReturnValue().Set(-1);
 
-      result = SearchString(reinterpret_cast<const uint16_t*>(haystack),
-                            haystack_length / 2,
-                            decoded_string,
-                            decoder.size() / 2,
-                            offset / 2,
-                            is_forward);
+      result = nbytes::SearchString(reinterpret_cast<const uint16_t*>(haystack),
+                                    haystack_length / 2,
+                                    decoded_string,
+                                    decoder.size() / 2,
+                                    offset / 2,
+                                    is_forward);
     } else {
-      result = SearchString(reinterpret_cast<const uint16_t*>(haystack),
-                            haystack_length / 2,
-                            reinterpret_cast<const uint16_t*>(*needle_value),
-                            needle_value.length(),
-                            offset / 2,
-                            is_forward);
+      result =
+          nbytes::SearchString(reinterpret_cast<const uint16_t*>(haystack),
+                               haystack_length / 2,
+                               reinterpret_cast<const uint16_t*>(*needle_value),
+                               needle_value.length(),
+                               offset / 2,
+                               is_forward);
     }
     result *= 2;
   } else if (enc == UTF8) {
@@ -953,12 +1000,13 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
     if (*needle_value == nullptr)
       return args.GetReturnValue().Set(-1);
 
-    result = SearchString(reinterpret_cast<const uint8_t*>(haystack),
-                          haystack_length,
-                          reinterpret_cast<const uint8_t*>(*needle_value),
-                          needle_length,
-                          offset,
-                          is_forward);
+    result =
+        nbytes::SearchString(reinterpret_cast<const uint8_t*>(haystack),
+                             haystack_length,
+                             reinterpret_cast<const uint8_t*>(*needle_value),
+                             needle_length,
+                             offset,
+                             is_forward);
   } else if (enc == LATIN1) {
     uint8_t* needle_data = node::UncheckedMalloc<uint8_t>(needle_length);
     if (needle_data == nullptr) {
@@ -967,12 +1015,12 @@ void IndexOfString(const FunctionCallbackInfo<Value>& args) {
     needle->WriteOneByte(
         isolate, needle_data, 0, needle_length, String::NO_NULL_TERMINATION);
 
-    result = SearchString(reinterpret_cast<const uint8_t*>(haystack),
-                          haystack_length,
-                          needle_data,
-                          needle_length,
-                          offset,
-                          is_forward);
+    result = nbytes::SearchString(reinterpret_cast<const uint8_t*>(haystack),
+                                  haystack_length,
+                                  needle_data,
+                                  needle_length,
+                                  offset,
+                                  is_forward);
     free(needle_data);
   }
 
@@ -1031,65 +1079,83 @@ void IndexOfBuffer(const FunctionCallbackInfo<Value>& args) {
     if (haystack_length < 2 || needle_length < 2) {
       return args.GetReturnValue().Set(-1);
     }
-    result = SearchString(
-        reinterpret_cast<const uint16_t*>(haystack),
-        haystack_length / 2,
-        reinterpret_cast<const uint16_t*>(needle),
-        needle_length / 2,
-        offset / 2,
-        is_forward);
+    result = nbytes::SearchString(reinterpret_cast<const uint16_t*>(haystack),
+                                  haystack_length / 2,
+                                  reinterpret_cast<const uint16_t*>(needle),
+                                  needle_length / 2,
+                                  offset / 2,
+                                  is_forward);
     result *= 2;
   } else {
-    result = SearchString(
-        reinterpret_cast<const uint8_t*>(haystack),
-        haystack_length,
-        reinterpret_cast<const uint8_t*>(needle),
-        needle_length,
-        offset,
-        is_forward);
+    result = nbytes::SearchString(reinterpret_cast<const uint8_t*>(haystack),
+                                  haystack_length,
+                                  reinterpret_cast<const uint8_t*>(needle),
+                                  needle_length,
+                                  offset,
+                                  is_forward);
   }
 
   args.GetReturnValue().Set(
       result == haystack_length ? -1 : static_cast<int>(result));
 }
 
-void IndexOfNumber(const FunctionCallbackInfo<Value>& args) {
+int32_t IndexOfNumber(const uint8_t* buffer_data,
+                      size_t buffer_length,
+                      uint32_t needle,
+                      int64_t offset_i64,
+                      bool is_forward) {
+  int64_t opt_offset = IndexOfOffset(buffer_length, offset_i64, 1, is_forward);
+  if (opt_offset <= -1 || buffer_length == 0) {
+    return -1;
+  }
+  size_t offset = static_cast<size_t>(opt_offset);
+  CHECK_LT(offset, buffer_length);
+
+  const void* ptr;
+  if (is_forward) {
+    ptr = memchr(buffer_data + offset, needle, buffer_length - offset);
+  } else {
+    ptr = nbytes::stringsearch::MemrchrFill(buffer_data, needle, offset + 1);
+  }
+  const uint8_t* ptr_uint8 = static_cast<const uint8_t*>(ptr);
+  return ptr != nullptr ? static_cast<int32_t>(ptr_uint8 - buffer_data) : -1;
+}
+
+void SlowIndexOfNumber(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[1]->IsUint32());
   CHECK(args[2]->IsNumber());
   CHECK(args[3]->IsBoolean());
 
   THROW_AND_RETURN_UNLESS_BUFFER(Environment::GetCurrent(args), args[0]);
-  ArrayBufferViewContents<char> buffer(args[0]);
+  ArrayBufferViewContents<uint8_t> buffer(args[0]);
 
   uint32_t needle = args[1].As<Uint32>()->Value();
   int64_t offset_i64 = args[2].As<Integer>()->Value();
   bool is_forward = args[3]->IsTrue();
 
-  int64_t opt_offset =
-      IndexOfOffset(buffer.length(), offset_i64, 1, is_forward);
-  if (opt_offset <= -1 || buffer.length() == 0) {
-    return args.GetReturnValue().Set(-1);
-  }
-  size_t offset = static_cast<size_t>(opt_offset);
-  CHECK_LT(offset, buffer.length());
-
-  const void* ptr;
-  if (is_forward) {
-    ptr = memchr(buffer.data() + offset, needle, buffer.length() - offset);
-  } else {
-    ptr = node::stringsearch::MemrchrFill(buffer.data(), needle, offset + 1);
-  }
-  const char* ptr_char = static_cast<const char*>(ptr);
-  args.GetReturnValue().Set(ptr ? static_cast<int>(ptr_char - buffer.data())
-                                : -1);
+  args.GetReturnValue().Set(IndexOfNumber(
+      buffer.data(), buffer.length(), needle, offset_i64, is_forward));
 }
 
+int32_t FastIndexOfNumber(v8::Local<v8::Value>,
+                          const FastApiTypedArray<uint8_t>& buffer,
+                          uint32_t needle,
+                          int64_t offset_i64,
+                          bool is_forward) {
+  uint8_t* buffer_data;
+  CHECK(buffer.getStorageIfAligned(&buffer_data));
+  return IndexOfNumber(
+      buffer_data, buffer.length(), needle, offset_i64, is_forward);
+}
+
+static v8::CFunction fast_index_of_number(
+    v8::CFunction::Make(FastIndexOfNumber));
 
 void Swap16(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
   SPREAD_BUFFER_ARG(args[0], ts_obj);
-  SwapBytes16(ts_obj_data, ts_obj_length);
+  CHECK(nbytes::SwapBytes16(ts_obj_data, ts_obj_length));
   args.GetReturnValue().Set(args[0]);
 }
 
@@ -1098,7 +1164,7 @@ void Swap32(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
   SPREAD_BUFFER_ARG(args[0], ts_obj);
-  SwapBytes32(ts_obj_data, ts_obj_length);
+  CHECK(nbytes::SwapBytes32(ts_obj_data, ts_obj_length));
   args.GetReturnValue().Set(args[0]);
 }
 
@@ -1107,84 +1173,49 @@ void Swap64(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
   SPREAD_BUFFER_ARG(args[0], ts_obj);
-  SwapBytes64(ts_obj_data, ts_obj_length);
+  CHECK(nbytes::SwapBytes64(ts_obj_data, ts_obj_length));
   args.GetReturnValue().Set(args[0]);
 }
 
-
-// Encode a single string to a UTF-8 Uint8Array (not Buffer).
-// Used in TextEncoder.prototype.encode.
-static void EncodeUtf8String(const FunctionCallbackInfo<Value>& args) {
+static void IsUtf8(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  Isolate* isolate = env->isolate();
-  CHECK_GE(args.Length(), 1);
-  CHECK(args[0]->IsString());
+  CHECK_EQ(args.Length(), 1);
+  CHECK(args[0]->IsTypedArray() || args[0]->IsArrayBuffer() ||
+        args[0]->IsSharedArrayBuffer());
+  ArrayBufferViewContents<char> abv(args[0]);
 
-  Local<String> str = args[0].As<String>();
-  size_t length = str->Utf8Length(isolate);
-
-  Local<ArrayBuffer> ab;
-  {
-    NoArrayBufferZeroFillScope no_zero_fill_scope(env->isolate_data());
-    std::unique_ptr<BackingStore> bs =
-        ArrayBuffer::NewBackingStore(isolate, length);
-
-    CHECK(bs);
-
-    str->WriteUtf8(isolate,
-                   static_cast<char*>(bs->Data()),
-                   -1,  // We are certain that `data` is sufficiently large
-                   nullptr,
-                   String::NO_NULL_TERMINATION | String::REPLACE_INVALID_UTF8);
-
-    ab = ArrayBuffer::New(isolate, std::move(bs));
+  if (abv.WasDetached()) {
+    return node::THROW_ERR_INVALID_STATE(
+        env, "Cannot validate on a detached buffer");
   }
 
-  auto array = Uint8Array::New(ab, 0, length);
-  args.GetReturnValue().Set(array);
+  args.GetReturnValue().Set(simdutf::validate_utf8(abv.data(), abv.length()));
 }
 
-
-static void EncodeInto(const FunctionCallbackInfo<Value>& args) {
+static void IsAscii(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  Isolate* isolate = env->isolate();
-  CHECK_GE(args.Length(), 3);
-  CHECK(args[0]->IsString());
-  CHECK(args[1]->IsUint8Array());
-  CHECK(args[2]->IsUint32Array());
+  CHECK_EQ(args.Length(), 1);
+  CHECK(args[0]->IsTypedArray() || args[0]->IsArrayBuffer() ||
+        args[0]->IsSharedArrayBuffer());
+  ArrayBufferViewContents<char> abv(args[0]);
 
-  Local<String> source = args[0].As<String>();
+  if (abv.WasDetached()) {
+    return node::THROW_ERR_INVALID_STATE(
+        env, "Cannot validate on a detached buffer");
+  }
 
-  Local<Uint8Array> dest = args[1].As<Uint8Array>();
-  Local<ArrayBuffer> buf = dest->Buffer();
-  char* write_result =
-      static_cast<char*>(buf->GetBackingStore()->Data()) + dest->ByteOffset();
-  size_t dest_length = dest->ByteLength();
-
-  // results = [ read, written ]
-  Local<Uint32Array> result_arr = args[2].As<Uint32Array>();
-  uint32_t* results = reinterpret_cast<uint32_t*>(
-      static_cast<char*>(result_arr->Buffer()->GetBackingStore()->Data()) +
-      result_arr->ByteOffset());
-
-  int nchars;
-  int written = source->WriteUtf8(
-      isolate,
-      write_result,
-      dest_length,
-      &nchars,
-      String::NO_NULL_TERMINATION | String::REPLACE_INVALID_UTF8);
-  results[0] = nchars;
-  results[1] = written;
+  args.GetReturnValue().Set(simdutf::validate_ascii(abv.data(), abv.length()));
 }
-
 
 void SetBufferPrototype(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
+  Realm* realm = Realm::GetCurrent(args);
+
+  // TODO(legendecas): Remove this check once the binding supports sub-realms.
+  CHECK_EQ(realm->kind(), Realm::Kind::kPrincipal);
 
   CHECK(args[0]->IsObject());
   Local<Object> proto = args[0].As<Object>();
-  env->set_buffer_prototype_object(proto);
+  realm->set_buffer_prototype_object(proto);
 }
 
 void GetZeroFillToggle(const FunctionCallbackInfo<Value>& args) {
@@ -1222,11 +1253,156 @@ void DetachArrayBuffer(const FunctionCallbackInfo<Value>& args) {
     Local<ArrayBuffer> buf = args[0].As<ArrayBuffer>();
     if (buf->IsDetachable()) {
       std::shared_ptr<BackingStore> store = buf->GetBackingStore();
-      buf->Detach();
+      buf->Detach(Local<Value>()).Check();
       args.GetReturnValue().Set(ArrayBuffer::New(env->isolate(), store));
     }
   }
 }
+
+static void Btoa(const FunctionCallbackInfo<Value>& args) {
+  CHECK_EQ(args.Length(), 1);
+  Environment* env = Environment::GetCurrent(args);
+  THROW_AND_RETURN_IF_NOT_STRING(env, args[0], "argument");
+
+  Local<String> input = args[0].As<String>();
+  MaybeStackBuffer<char> buffer;
+  size_t written;
+
+  if (input->IsExternalOneByte()) {  // 8-bit case
+    auto ext = input->GetExternalOneByteStringResource();
+    size_t expected_length = simdutf::base64_length_from_binary(ext->length());
+    buffer.AllocateSufficientStorage(expected_length + 1);
+    buffer.SetLengthAndZeroTerminate(expected_length);
+    written =
+        simdutf::binary_to_base64(ext->data(), ext->length(), buffer.out());
+  } else if (input->IsOneByte()) {
+    MaybeStackBuffer<uint8_t> stack_buf(input->Length());
+    input->WriteOneByte(env->isolate(),
+                        stack_buf.out(),
+                        0,
+                        input->Length(),
+                        String::NO_NULL_TERMINATION);
+
+    size_t expected_length =
+        simdutf::base64_length_from_binary(input->Length());
+    buffer.AllocateSufficientStorage(expected_length + 1);
+    buffer.SetLengthAndZeroTerminate(expected_length);
+    written =
+        simdutf::binary_to_base64(reinterpret_cast<const char*>(*stack_buf),
+                                  input->Length(),
+                                  buffer.out());
+  } else {
+    String::Value value(env->isolate(), input);
+    MaybeStackBuffer<char> stack_buf(value.length());
+    size_t out_len = simdutf::convert_utf16_to_latin1(
+        reinterpret_cast<const char16_t*>(*value),
+        value.length(),
+        stack_buf.out());
+    if (out_len == 0) {  // error
+      return args.GetReturnValue().Set(-1);
+    }
+    size_t expected_length = simdutf::base64_length_from_binary(out_len);
+    buffer.AllocateSufficientStorage(expected_length + 1);
+    buffer.SetLengthAndZeroTerminate(expected_length);
+    written = simdutf::binary_to_base64(*stack_buf, out_len, buffer.out());
+  }
+
+  auto value =
+      String::NewFromOneByte(env->isolate(),
+                             reinterpret_cast<const uint8_t*>(buffer.out()),
+                             NewStringType::kNormal,
+                             written)
+          .ToLocalChecked();
+  return args.GetReturnValue().Set(value);
+}
+
+// In case of success, the decoded string is returned.
+// In case of error, a negative value is returned:
+// * -1 indicates a single character remained,
+// * -2 indicates an invalid character,
+// * -3 indicates a possible overflow (i.e., more than 2 GB output).
+static void Atob(const FunctionCallbackInfo<Value>& args) {
+  CHECK_EQ(args.Length(), 1);
+  Environment* env = Environment::GetCurrent(args);
+  THROW_AND_RETURN_IF_NOT_STRING(env, args[0], "argument");
+
+  Local<String> input = args[0].As<String>();
+  MaybeStackBuffer<char> buffer;
+  simdutf::result result;
+
+  if (input->IsExternalOneByte()) {  // 8-bit case
+    auto ext = input->GetExternalOneByteStringResource();
+    size_t expected_length =
+        simdutf::maximal_binary_length_from_base64(ext->data(), ext->length());
+    buffer.AllocateSufficientStorage(expected_length);
+    buffer.SetLength(expected_length);
+    result = simdutf::base64_to_binary(
+        ext->data(), ext->length(), buffer.out(), simdutf::base64_default);
+  } else if (input->IsOneByte()) {
+    MaybeStackBuffer<uint8_t> stack_buf(input->Length());
+    input->WriteOneByte(args.GetIsolate(),
+                        stack_buf.out(),
+                        0,
+                        input->Length(),
+                        String::NO_NULL_TERMINATION);
+    const char* data = reinterpret_cast<const char*>(*stack_buf);
+    size_t expected_length =
+        simdutf::maximal_binary_length_from_base64(data, input->Length());
+    buffer.AllocateSufficientStorage(expected_length);
+    buffer.SetLength(expected_length);
+    result = simdutf::base64_to_binary(data, input->Length(), buffer.out());
+  } else {  // 16-bit case
+    String::Value value(env->isolate(), input);
+    auto data = reinterpret_cast<const char16_t*>(*value);
+    size_t expected_length =
+        simdutf::maximal_binary_length_from_base64(data, value.length());
+    buffer.AllocateSufficientStorage(expected_length);
+    buffer.SetLength(expected_length);
+    result = simdutf::base64_to_binary(data, value.length(), buffer.out());
+  }
+
+  if (result.error == simdutf::error_code::SUCCESS) {
+    auto value =
+        String::NewFromOneByte(env->isolate(),
+                               reinterpret_cast<const uint8_t*>(buffer.out()),
+                               NewStringType::kNormal,
+                               result.count)
+            .ToLocalChecked();
+    return args.GetReturnValue().Set(value);
+  }
+
+  // Default value is: "possible overflow"
+  int32_t error_code = -3;
+
+  if (result.error == simdutf::error_code::INVALID_BASE64_CHARACTER) {
+    error_code = -2;
+  } else if (result.error == simdutf::error_code::BASE64_INPUT_REMAINDER) {
+    error_code = -1;
+  }
+
+  args.GetReturnValue().Set(error_code);
+}
+
+namespace {
+
+std::pair<void*, size_t> DecomposeBufferToParts(Local<Value> buffer) {
+  void* pointer;
+  size_t byte_length;
+  if (buffer->IsArrayBuffer()) {
+    Local<ArrayBuffer> ab = buffer.As<ArrayBuffer>();
+    pointer = ab->Data();
+    byte_length = ab->ByteLength();
+  } else if (buffer->IsSharedArrayBuffer()) {
+    Local<SharedArrayBuffer> ab = buffer.As<SharedArrayBuffer>();
+    pointer = ab->Data();
+    byte_length = ab->ByteLength();
+  } else {
+    UNREACHABLE();  // Caller must validate.
+  }
+  return {pointer, byte_length};
+}
+
+}  // namespace
 
 void CopyArrayBuffer(const FunctionCallbackInfo<Value>& args) {
   // args[0] == Destination ArrayBuffer
@@ -1241,111 +1417,223 @@ void CopyArrayBuffer(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[3]->IsUint32());
   CHECK(args[4]->IsUint32());
 
-  std::shared_ptr<BackingStore> destination;
-  std::shared_ptr<BackingStore> source;
+  void* destination;
+  size_t destination_byte_length;
+  std::tie(destination, destination_byte_length) =
+      DecomposeBufferToParts(args[0]);
 
-  if (args[0]->IsArrayBuffer()) {
-    destination = args[0].As<ArrayBuffer>()->GetBackingStore();
-  } else if (args[0]->IsSharedArrayBuffer()) {
-    destination = args[0].As<SharedArrayBuffer>()->GetBackingStore();
-  }
-
-  if (args[2]->IsArrayBuffer()) {
-    source = args[2].As<ArrayBuffer>()->GetBackingStore();
-  } else if (args[0]->IsSharedArrayBuffer()) {
-    source = args[2].As<SharedArrayBuffer>()->GetBackingStore();
-  }
+  void* source;
+  size_t source_byte_length;
+  std::tie(source, source_byte_length) = DecomposeBufferToParts(args[2]);
 
   uint32_t destination_offset = args[1].As<Uint32>()->Value();
   uint32_t source_offset = args[3].As<Uint32>()->Value();
   size_t bytes_to_copy = args[4].As<Uint32>()->Value();
 
-  CHECK_GE(destination->ByteLength() - destination_offset, bytes_to_copy);
-  CHECK_GE(source->ByteLength() - source_offset, bytes_to_copy);
+  CHECK_GE(destination_byte_length - destination_offset, bytes_to_copy);
+  CHECK_GE(source_byte_length - source_offset, bytes_to_copy);
 
-  uint8_t* dest =
-      static_cast<uint8_t*>(destination->Data()) + destination_offset;
-  uint8_t* src =
-      static_cast<uint8_t*>(source->Data()) + source_offset;
+  uint8_t* dest = static_cast<uint8_t*>(destination) + destination_offset;
+  uint8_t* src = static_cast<uint8_t*>(source) + source_offset;
   memcpy(dest, src, bytes_to_copy);
 }
+
+template <encoding encoding>
+uint32_t WriteOneByteString(const char* src,
+                            uint32_t src_len,
+                            char* dst,
+                            uint32_t dst_len) {
+  if (dst_len == 0) {
+    return 0;
+  }
+
+  if (encoding == UTF8) {
+    return simdutf::convert_latin1_to_utf8_safe(src, src_len, dst, dst_len);
+  } else if (encoding == LATIN1 || encoding == ASCII) {
+    const auto size = std::min(src_len, dst_len);
+    memcpy(dst, src, size);
+    return size;
+  } else {
+    // TODO(ronag): Add support for more encoding.
+    UNREACHABLE();
+  }
+}
+
+template <encoding encoding>
+void SlowWriteString(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+
+  THROW_AND_RETURN_UNLESS_BUFFER(env, args[0]);
+  SPREAD_BUFFER_ARG(args[0], ts_obj);
+
+  THROW_AND_RETURN_IF_NOT_STRING(env, args[1], "argument");
+
+  Local<String> str = args[1]->ToString(env->context()).ToLocalChecked();
+
+  size_t offset = 0;
+  size_t max_length = 0;
+
+  THROW_AND_RETURN_IF_OOB(ParseArrayIndex(env, args[2], 0, &offset));
+  THROW_AND_RETURN_IF_OOB(
+      ParseArrayIndex(env, args[3], ts_obj_length - offset, &max_length));
+
+  max_length = std::min(ts_obj_length - offset, max_length);
+
+  if (max_length == 0) return args.GetReturnValue().Set(0);
+
+  uint32_t written = 0;
+
+  if ((encoding == UTF8 || encoding == LATIN1 || encoding == ASCII) &&
+      str->IsExternalOneByte()) {
+    const auto src = str->GetExternalOneByteStringResource();
+    written = WriteOneByteString<encoding>(
+        src->data(), src->length(), ts_obj_data + offset, max_length);
+  } else {
+    written = StringBytes::Write(
+        env->isolate(), ts_obj_data + offset, max_length, str, encoding);
+  }
+
+  args.GetReturnValue().Set(written);
+}
+
+template <encoding encoding>
+uint32_t FastWriteString(Local<Value> receiver,
+                         const v8::FastApiTypedArray<uint8_t>& dst,
+                         const v8::FastOneByteString& src,
+                         uint32_t offset,
+                         uint32_t max_length) {
+  uint8_t* dst_data;
+  CHECK(dst.getStorageIfAligned(&dst_data));
+  CHECK(offset <= dst.length());
+  CHECK(dst.length() - offset <= std::numeric_limits<uint32_t>::max());
+  TRACK_V8_FAST_API_CALL("buffer.writeString");
+
+  return WriteOneByteString<encoding>(
+      src.data,
+      src.length,
+      reinterpret_cast<char*>(dst_data + offset),
+      std::min<uint32_t>(dst.length() - offset, max_length));
+}
+
+static v8::CFunction fast_write_string_ascii(
+    v8::CFunction::Make(FastWriteString<ASCII>));
+static v8::CFunction fast_write_string_latin1(
+    v8::CFunction::Make(FastWriteString<LATIN1>));
+static v8::CFunction fast_write_string_utf8(
+    v8::CFunction::Make(FastWriteString<UTF8>));
 
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
                 void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
-  env->SetMethod(target, "setBufferPrototype", SetBufferPrototype);
-  env->SetMethodNoSideEffect(target, "createFromString", CreateFromString);
+  SetMethodNoSideEffect(context, target, "atob", Atob);
+  SetMethodNoSideEffect(context, target, "btoa", Btoa);
 
-  env->SetMethodNoSideEffect(target, "byteLengthUtf8", ByteLengthUtf8);
-  env->SetMethod(target, "copy", Copy);
-  env->SetMethodNoSideEffect(target, "compare", Compare);
-  env->SetMethodNoSideEffect(target, "compareOffset", CompareOffset);
-  env->SetMethod(target, "fill", Fill);
-  env->SetMethodNoSideEffect(target, "indexOfBuffer", IndexOfBuffer);
-  env->SetMethodNoSideEffect(target, "indexOfNumber", IndexOfNumber);
-  env->SetMethodNoSideEffect(target, "indexOfString", IndexOfString);
+  SetMethod(context, target, "setBufferPrototype", SetBufferPrototype);
 
-  env->SetMethod(target, "detachArrayBuffer", DetachArrayBuffer);
-  env->SetMethod(target, "copyArrayBuffer", CopyArrayBuffer);
+  SetFastMethodNoSideEffect(context,
+                            target,
+                            "byteLengthUtf8",
+                            SlowByteLengthUtf8,
+                            &fast_byte_length_utf8);
+  SetFastMethod(context, target, "copy", SlowCopy, &fast_copy);
+  SetFastMethodNoSideEffect(context, target, "compare", Compare, &fast_compare);
+  SetMethodNoSideEffect(context, target, "compareOffset", CompareOffset);
+  SetMethod(context, target, "fill", Fill);
+  SetMethodNoSideEffect(context, target, "indexOfBuffer", IndexOfBuffer);
+  SetFastMethodNoSideEffect(context,
+                            target,
+                            "indexOfNumber",
+                            SlowIndexOfNumber,
+                            &fast_index_of_number);
+  SetMethodNoSideEffect(context, target, "indexOfString", IndexOfString);
 
-  env->SetMethod(target, "swap16", Swap16);
-  env->SetMethod(target, "swap32", Swap32);
-  env->SetMethod(target, "swap64", Swap64);
+  SetMethod(context, target, "detachArrayBuffer", DetachArrayBuffer);
+  SetMethod(context, target, "copyArrayBuffer", CopyArrayBuffer);
 
-  env->SetMethod(target, "encodeInto", EncodeInto);
-  env->SetMethodNoSideEffect(target, "encodeUtf8String", EncodeUtf8String);
+  SetMethod(context, target, "swap16", Swap16);
+  SetMethod(context, target, "swap32", Swap32);
+  SetMethod(context, target, "swap64", Swap64);
 
-  target->Set(env->context(),
-              FIXED_ONE_BYTE_STRING(env->isolate(), "kMaxLength"),
-              Number::New(env->isolate(), kMaxLength)).Check();
+  SetMethodNoSideEffect(context, target, "isUtf8", IsUtf8);
+  SetMethodNoSideEffect(context, target, "isAscii", IsAscii);
 
-  target->Set(env->context(),
-              FIXED_ONE_BYTE_STRING(env->isolate(), "kStringMaxLength"),
-              Integer::New(env->isolate(), String::kMaxLength)).Check();
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(isolate, "kMaxLength"),
+            Number::New(isolate, kMaxLength))
+      .Check();
 
-  env->SetMethodNoSideEffect(target, "asciiSlice", StringSlice<ASCII>);
-  env->SetMethodNoSideEffect(target, "base64Slice", StringSlice<BASE64>);
-  env->SetMethodNoSideEffect(target, "base64urlSlice", StringSlice<BASE64URL>);
-  env->SetMethodNoSideEffect(target, "latin1Slice", StringSlice<LATIN1>);
-  env->SetMethodNoSideEffect(target, "hexSlice", StringSlice<HEX>);
-  env->SetMethodNoSideEffect(target, "ucs2Slice", StringSlice<UCS2>);
-  env->SetMethodNoSideEffect(target, "utf8Slice", StringSlice<UTF8>);
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(isolate, "kStringMaxLength"),
+            Integer::New(isolate, String::kMaxLength))
+      .Check();
 
-  env->SetMethod(target, "asciiWrite", StringWrite<ASCII>);
-  env->SetMethod(target, "base64Write", StringWrite<BASE64>);
-  env->SetMethod(target, "base64urlWrite", StringWrite<BASE64URL>);
-  env->SetMethod(target, "latin1Write", StringWrite<LATIN1>);
-  env->SetMethod(target, "hexWrite", StringWrite<HEX>);
-  env->SetMethod(target, "ucs2Write", StringWrite<UCS2>);
-  env->SetMethod(target, "utf8Write", StringWrite<UTF8>);
+  SetMethodNoSideEffect(context, target, "asciiSlice", StringSlice<ASCII>);
+  SetMethodNoSideEffect(context, target, "base64Slice", StringSlice<BASE64>);
+  SetMethodNoSideEffect(
+      context, target, "base64urlSlice", StringSlice<BASE64URL>);
+  SetMethodNoSideEffect(context, target, "latin1Slice", StringSlice<LATIN1>);
+  SetMethodNoSideEffect(context, target, "hexSlice", StringSlice<HEX>);
+  SetMethodNoSideEffect(context, target, "ucs2Slice", StringSlice<UCS2>);
+  SetMethodNoSideEffect(context, target, "utf8Slice", StringSlice<UTF8>);
 
-  env->SetMethod(target, "getZeroFillToggle", GetZeroFillToggle);
+  SetMethod(context, target, "base64Write", StringWrite<BASE64>);
+  SetMethod(context, target, "base64urlWrite", StringWrite<BASE64URL>);
+  SetMethod(context, target, "hexWrite", StringWrite<HEX>);
+  SetMethod(context, target, "ucs2Write", StringWrite<UCS2>);
+
+  SetFastMethod(context,
+                target,
+                "asciiWriteStatic",
+                SlowWriteString<ASCII>,
+                &fast_write_string_ascii);
+  SetFastMethod(context,
+                target,
+                "latin1WriteStatic",
+                SlowWriteString<LATIN1>,
+                &fast_write_string_latin1);
+  SetFastMethod(context,
+                target,
+                "utf8WriteStatic",
+                SlowWriteString<UTF8>,
+                &fast_write_string_utf8);
+
+  SetMethod(context, target, "getZeroFillToggle", GetZeroFillToggle);
 }
 
 }  // anonymous namespace
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(SetBufferPrototype);
-  registry->Register(CreateFromString);
 
-  registry->Register(ByteLengthUtf8);
-  registry->Register(Copy);
+  registry->Register(SlowByteLengthUtf8);
+  registry->Register(fast_byte_length_utf8.GetTypeInfo());
+  registry->Register(FastByteLengthUtf8);
+  registry->Register(SlowCopy);
+  registry->Register(fast_copy.GetTypeInfo());
+  registry->Register(FastCopy);
   registry->Register(Compare);
+  registry->Register(FastCompare);
+  registry->Register(fast_compare.GetTypeInfo());
   registry->Register(CompareOffset);
   registry->Register(Fill);
   registry->Register(IndexOfBuffer);
-  registry->Register(IndexOfNumber);
+  registry->Register(SlowIndexOfNumber);
+  registry->Register(FastIndexOfNumber);
+  registry->Register(fast_index_of_number.GetTypeInfo());
   registry->Register(IndexOfString);
 
   registry->Register(Swap16);
   registry->Register(Swap32);
   registry->Register(Swap64);
 
-  registry->Register(EncodeInto);
-  registry->Register(EncodeUtf8String);
+  registry->Register(IsUtf8);
+  registry->Register(IsAscii);
 
   registry->Register(StringSlice<ASCII>);
   registry->Register(StringSlice<BASE64>);
@@ -1355,6 +1643,15 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(StringSlice<UCS2>);
   registry->Register(StringSlice<UTF8>);
 
+  registry->Register(SlowWriteString<ASCII>);
+  registry->Register(SlowWriteString<LATIN1>);
+  registry->Register(SlowWriteString<UTF8>);
+  registry->Register(FastWriteString<ASCII>);
+  registry->Register(fast_write_string_ascii.GetTypeInfo());
+  registry->Register(FastWriteString<LATIN1>);
+  registry->Register(fast_write_string_latin1.GetTypeInfo());
+  registry->Register(FastWriteString<UTF8>);
+  registry->Register(fast_write_string_utf8.GetTypeInfo());
   registry->Register(StringWrite<ASCII>);
   registry->Register(StringWrite<BASE64>);
   registry->Register(StringWrite<BASE64URL>);
@@ -1366,10 +1663,14 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
 
   registry->Register(DetachArrayBuffer);
   registry->Register(CopyArrayBuffer);
+
+  registry->Register(Atob);
+  registry->Register(Btoa);
 }
 
 }  // namespace Buffer
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(buffer, node::Buffer::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(buffer, node::Buffer::RegisterExternalReferences)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(buffer, node::Buffer::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(buffer,
+                                node::Buffer::RegisterExternalReferences)
